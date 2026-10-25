@@ -111,7 +111,7 @@ it does not pin the version of `espflash` itself.
 ## Build and run the firmware
 
 The generated firmware is now part of this repository; there is no need to run `cargo init` or generate it again.
-The Cargo package and binary retain the generated name `esp32-c6-starter`.
+The Cargo package and default binary are named `esp32-c6-rust`, matching the repository.
 
 Run this from the repository root to compile without connecting to a board:
 
@@ -244,7 +244,7 @@ The colors, brightness, GPIO8 connection, and on/off timing have not changed.
 
 ```sh
 cargo build --release
-cargo clippy --bin esp32-c6-starter -- -D warnings
+cargo clippy --bin esp32-c6-rust -- -D warnings
 ```
 
 Both checks passed after the conversion. They compile and lint the firmware without flashing.
@@ -284,7 +284,7 @@ There are now two firmware binaries. Only one runs on the board at a time:
 
 | Binary | Purpose |
 | --- | --- |
-| `esp32-c6-starter` (default) | The existing, hardware-tested five-color blinking firmware |
+| `esp32-c6-rust` (default) | The existing, hardware-tested five-color blinking firmware |
 | `matter-thread` | Experimental Matter On/Off Light endpoint, BLE commissioning, and Thread transport |
 
 The second binary is in `src/bin/matter_thread.rs` and requires the opt-in `matter-thread` feature.

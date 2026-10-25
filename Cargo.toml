@@ -1,12 +1,12 @@
 [package]
 edition      = "2024"
-name         = "esp32-c6-starter"
-default-run  = "esp32-c6-starter"
+name         = "esp32-c6-rust"
+default-run  = "esp32-c6-rust"
 rust-version = "1.95"
 version      = "0.1.0"
 
 [[bin]]
-name = "esp32-c6-starter"
+name = "esp32-c6-rust"
 path = "./src/bin/main.rs"
 
 [[bin]]

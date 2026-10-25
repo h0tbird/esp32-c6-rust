@@ -2065,7 +2065,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "esp32-c6-starter"
+name = "esp32-c6-rust"
 version = "0.1.0"
 dependencies = [
  "critical-section",
