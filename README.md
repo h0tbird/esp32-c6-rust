@@ -21,7 +21,7 @@ encryption is not configured. Never commit home-network credentials or raw commi
 - **iPhone:** supplies the Thread network configuration during Bluetooth commissioning.
   Bluetooth is still required for initial setup even though normal control uses Thread.
 
-**On** repeats red, green, cyan, blue, and magenta: 500 ms lit, then 500 ms black.
+**On** repeats red, green, blue, and cyan: 500 ms lit, then 500 ms black.
 Brightness is 10/255 per active channel. **Off** interrupts the wait and sends black.
 The first boot starts off; subsequent boots restore the saved state unless the Matter
 `StartUpOnOff` attribute requests Off, On, or Toggle.
@@ -244,7 +244,7 @@ needed again for each command.
 Run these from any directory:
 
 ```sh
-# On: start the five-color blinking sequence.
+# On: start the four-color blinking sequence.
 chip-tool onoff on 1234 1 \
   --storage-directory "$HOME/.config/chip-tool"
 

@@ -1,10 +1,9 @@
 pub const HALF_PERIOD_MS: u64 = 500;
-pub const COLORS: [(&str, [u8; 3]); 5] = [
+pub const COLORS: [(&str, [u8; 3]); 4] = [
     ("red", [10, 0, 0]),
     ("green", [0, 10, 0]),
-    ("cyan", [0, 10, 10]),
     ("blue", [0, 0, 10]),
-    ("magenta", [10, 0, 10]),
+    ("cyan", [0, 10, 10]),
 ];
 pub const OFF: (&str, [u8; 3]) = ("off", [0, 0, 0]);
 
@@ -82,10 +81,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn repeats_five_colors_with_black_between_each() {
+    fn repeats_four_colors_with_black_between_each() {
         let mut sequence = BlinkSequence::default();
+        let expected = [
+            ("red", [10, 0, 0]),
+            ("green", [0, 10, 0]),
+            ("blue", [0, 0, 10]),
+            ("cyan", [0, 10, 10]),
+        ];
+        assert_eq!(COLORS, expected);
         for _ in 0..3 {
-            for color in COLORS {
+            for color in expected {
                 assert_eq!(sequence.next_frame(true), color);
                 assert_eq!(sequence.next_frame(true), OFF);
             }
@@ -95,7 +101,7 @@ mod tests {
 
     #[test]
     fn disabling_at_any_phase_is_black_and_restarts_at_red() {
-        for phase in 0..10 {
+        for phase in 0..COLORS.len() * 2 {
             let mut sequence = BlinkSequence::default();
             for _ in 0..=phase {
                 sequence.next_frame(true);
