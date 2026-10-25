@@ -1,5 +1,11 @@
 {
     "version": "2.0.0",
+    "options": {
+        "env": {
+            "CLANG_PATH": "/opt/homebrew/opt/llvm/bin/clang",
+            "LIBCLANG_PATH": "/opt/homebrew/opt/llvm/lib"
+        }
+    },
     "tasks": [
         {
             "label": "build-release",

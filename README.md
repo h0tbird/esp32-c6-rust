@@ -96,8 +96,17 @@ No project generation is needed after cloning: `esp-generate`, `esp-config`, and
 `cargo init` are not part of the normal build workflow. `probe-rs` is also unnecessary
 for the serial flashing/monitoring workflow used here.
 
-VS Code extension recommendations are in `.vscode/extensions.json`. Run VS Code from
-a terminal with the build environment configured if its tasks cannot find the tools.
+VS Code extension recommendations are in `.vscode/extensions.json`. The workspace
+settings pass `CLANG_PATH` and `LIBCLANG_PATH` explicitly to rust-analyzer's Cargo
+processes; the build/flash tasks use the same values. This prevents Flycheck from
+silently selecting Apple's `/usr/bin/clang` when VS Code did not inherit your terminal
+exports. The paths assume Apple Silicon Homebrew at `/opt/homebrew`; adjust both VS Code
+configuration files to the output of `brew --prefix llvm` on other installations.
+
+After changing the environment, run **rust-analyzer: Restart server** from the Command
+Palette. If necessary, use **Developer: Reload Window**. Shell exports still apply to
+commands you run manually; the VS Code settings do not modify your shell or the board.
+Run VS Code from a configured terminal if it cannot find Cargo, CMake, or other tools.
 
 ## Build, flash, and monitor
 
@@ -232,6 +241,19 @@ cargo fmt --manifest-path tests/host/Cargo.toml -- --check
 ```
 
 ## Troubleshooting
+
+### rust-analyzer / Flycheck cannot compile MbedTLS
+
+`Forcing on-the-fly build` means the selected crypto configuration differs from the
+prebuilt library, so the dependency must compile C locally. The long list of disabled
+options and inherited-frame-pointer warnings are not, by themselves, the fatal error.
+
+If the output identifies `AppleClang`, `/usr/bin/clang`, and
+`No available targets are compatible with triple "riscv32-unknown-unknown"`, VS Code is
+using a compiler without the required RISC-V backend. Check the explicit LLVM paths
+above and restart rust-analyzer. Do not enable unrelated crypto features to match the
+prebuilt library, disable Flycheck, or erase firmware data to work around this.
+This is a host-side editor/build failure, not a panic in the running ESP32 firmware.
 
 ### Home shows No Response
 

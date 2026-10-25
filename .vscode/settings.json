@@ -1,4 +1,8 @@
 {
   "rust-analyzer.cargo.allTargets": false,
   "rust-analyzer.cargo.target": "riscv32imac-unknown-none-elf",
+  "rust-analyzer.cargo.extraEnv": {
+    "CLANG_PATH": "/opt/homebrew/opt/llvm/bin/clang",
+    "LIBCLANG_PATH": "/opt/homebrew/opt/llvm/lib"
+  }
 }
