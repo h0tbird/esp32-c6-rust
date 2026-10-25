@@ -175,7 +175,8 @@ an ordinary single-color LED, and other boards may use a different pin or LED pr
 RMT channel 0 generates the LED signal using an 80 MHz peripheral clock. The firmware repeats
 red, green, cyan, blue, and magenta, with each color on for 500 milliseconds
 and the LED off for another 500 milliseconds. `LEVEL` sets the per-channel brightness to 10 out of 255.
-The delays block the CPU, which keeps this first example simple.
+The 500 ms waits use Embassy async timers, letting other tasks run while the LED waits.
+The short RMT LED transmissions still use the blocking driver.
 
 Build, flash, and monitor it with:
 
@@ -188,3 +189,94 @@ The driver uses the `RmtSmartLeds` API from `esp-hal-smartled 0.18.0`; older exa
 `SmartLedsWrite` supplies the `write` method, and `[color]` sends one pixel.
 Writing black (`RGB8::new(0, 0, 0)`) turns it off. Initialization or transmission errors
 stop the firmware with a panic rather than being ignored.
+
+## Embassy: async firmware
+
+Embassy is now enabled in this project. It lets firmware tasks wait without keeping the CPU
+busy in a delay loop. This is a first step toward running the LED alongside networking;
+it does not provide Thread or Matter by itself.
+
+On 2026-10-25, these dependencies were added:
+
+```sh
+cargo add esp-rtos@0.4.0 --features esp32c6,embassy,defmt
+cargo add embassy-executor@0.10.0 embassy-time@0.5.0
+```
+
+These are setup history, not commands to repeat after cloning: the dependencies are already
+in `Cargo.toml`, and `Cargo.lock` records the resolved versions.
+
+- `esp-rtos` supplies the Espressif runtime and its Embassy integration. The `esp32c6` feature
+  selects the chip, `embassy` enables async execution and timers, and `defmt` enables logging support.
+- `embassy-executor` supplies the executor types, including `Spawner`, which can launch async tasks.
+  Do not enable a separate executor platform feature: `esp-rtos` provides the integration.
+- `embassy-time` supplies async timers.
+
+### What changed in the code
+
+`src/bin/main.rs` now uses `#[esp_rtos::main]` and `async fn main` instead of the synchronous
+`#[main]` entry point. After initializing the chip, it passes timer group 0's first timer
+and the `FROM_CPU_INTR0` software interrupt to `esp_rtos::start`.
+Those resources are now owned by the runtime and must not be initialized again elsewhere.
+
+Each previous `delay.delay_millis(500)` is now:
+
+```rust
+Timer::after_millis(500).await;
+```
+
+`.await` suspends the current task until the timer expires, so the executor can run other ready
+tasks. The LED loop currently runs in the main task; no separate background tasks are needed yet.
+The colors, brightness, GPIO8 connection, and on/off timing have not changed.
+
+### Verify this milestone
+
+```sh
+cargo build --release
+cargo clippy --bin esp32-c6-starter -- -D warnings
+```
+
+Both checks passed after the conversion. They compile and lint the firmware without flashing.
+To check the physical board yourself, run:
+
+```sh
+cargo run --release
+```
+
+Expect the same red, green, cyan, blue, and magenta sequence, with 500 ms on and 500 ms off.
+The async conversion has not yet been verified on the physical board.
+
+## Next milestone: Apple Home over Matter and Thread
+
+Hardware for this project:
+
+- **ESP32-C6-DevKitC-1:** the onboard addressable RGB LED is connected to GPIO8.
+- **Apple TV model MN893LL/A:** Apple TV 4K (3rd generation), 128 GB Wi-Fi + Ethernet,
+  which supports Thread and can act as the home hub / Thread border router.
+
+On the iPhone, check **Home > ... > Home Settings > Home Hubs & Bridges** and confirm the Apple TV
+is listed and available. Keep the phone and Apple TV on the same home network, not an isolated guest network.
+
+**Not implemented yet:** this firmware does not advertise a Matter accessory, join Thread,
+or supply a pairing code. Enabling Embassy alone does not make it discoverable in Apple Home.
+
+The next integration will need:
+
+1. A compatible Thread and Matter stack, with BLE for initial commissioning.
+2. A Matter On/Off Light endpoint: **On** enables the blinking sequence; **Off** stops it and
+   turns the LED off. The blink timer must be interruptible so Off does not wait for a whole cycle.
+3. Persistent storage for pairing credentials and the Thread network configuration, plus a
+   deliberate factory-reset mechanism. Do not erase flash casually after pairing.
+4. A firmware-generated Matter setup code for **Home > + > Add Accessory**.
+   The board's serial number is not a Matter setup code.
+
+The [rs-matter-embassy project](https://github.com/sysgrok/rs-matter-embassy) provides a candidate
+ESP32-C6 Thread light integration. Its networking dependencies and flash-storage requirements
+still need to be checked against this project before adopting it. Development attestation
+credentials are for experiments, not a certified commercial accessory.
+
+References:
+
+- [Espressif esp-rtos 0.4.0 setup](https://docs.espressif.com/projects/rust/esp-rtos/0.4.0/esp32c6/esp_rtos/index.html)
+- [Apple TV model identification and Thread support](https://support.apple.com/en-us/101605)
+- [Adding Matter accessories to Apple Home](https://support.apple.com/en-us/102135)
