@@ -375,6 +375,42 @@ Radio cryptography still uses hardware entropy; the identity is not used as a cr
 Normal flashing with the same partition layout leaves the NVS contents intact. Do not use an
 erase-all command or change the partition layout after pairing unless you intend to reset the accessory.
 
+### Investigating MLE duplicate warnings
+
+The warning `Mle-----------: Failed to process UDP: Duplicated` is different from
+`SRP callback error: code=29`. In the pinned OpenThread source, `Mle::HandleUdpReceive`
+authenticates an incoming MLE message, then rejects it if its neighbor's frame counter
+is not newer than the last accepted counter, or its key sequence is older than the
+one already recorded for that neighbor. This is receive-side replay protection, not
+an LED error or evidence that an On/Off command itself was duplicated.
+
+The [OpenThread maintainer's explanation](https://github.com/orgs/openthread/discussions/9553)
+distinguishes retransmissions with the same counter from a sender losing counter state.
+The current warning does not print the sender or counters, so it cannot establish which
+case is happening here. Repeated warnings alone do not prove a radio-driver defect,
+insufficient range, or a persistent-storage bug in this application.
+
+The application does not override the operational Thread extended address, key sequence,
+or frame counters. Its stable hardware-derived EUI-64 is not the same thing as forcing
+a fixed operational extended address; the observed radio extended address changed across
+restarts. Changing device identity or erasing pairing is therefore not a justified fix.
+
+For this board, On/Off commands and reset recovery have worked while these warnings were
+present. Keep the replay checks and warning visibility enabled. Do not accept old counters,
+disable security, or suppress all OpenThread warnings just to obtain a quiet log.
+
+If control remains reliable, no corrective firmware change has been established as necessary.
+Keep the Apple TV and any other Thread routers' software up to date. If the warnings coincide
+with failures, capture a timestamped interval containing the control attempt, role changes,
+attachment failures, and any SRP errors. Compare operation near the Apple TV with the failing
+location rather than assuming all duplicate warnings are range-related.
+
+To distinguish the exact causes, further diagnostics must record the sender and received
+versus stored frame counters/key sequences at the rejection checks in OpenThread's C++
+receive path, without printing encryption keys or the Thread dataset. More color-loop logs
+or a blanket Rust log-level change cannot supply those missing values. No dependency fork,
+counter reset, or speculative radio change was applied during this investigation.
+
 ### Native build tools on macOS
 
 The networking stack includes C crypto dependencies. The first build found the following missing tools:
