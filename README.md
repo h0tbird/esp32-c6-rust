@@ -256,7 +256,7 @@ including the short off transmission, not the LED's optical output. Small schedu
 The startup message should appear only once per boot; if it repeats unexpectedly, check the
 surrounding output for a reset or panic rather than assuming the color delay is wrong.
 
-## Next milestone: Apple Home over Matter and Thread
+## Apple Home over Matter and Thread
 
 Hardware for this project:
 
@@ -267,23 +267,98 @@ Hardware for this project:
 On the iPhone, check **Home > ... > Home Settings > Home Hubs & Bridges** and confirm the Apple TV
 is listed and available. Keep the phone and Apple TV on the same home network, not an isolated guest network.
 
-**Not implemented yet:** this firmware does not advertise a Matter accessory, join Thread,
-or supply a pairing code. Enabling Embassy alone does not make it discoverable in Apple Home.
+### Checkpoint 1: buildable networking baseline
 
-The next integration will need:
+There are now two firmware binaries. Only one runs on the board at a time:
 
-1. A compatible Thread and Matter stack, with BLE for initial commissioning.
-2. A Matter On/Off Light endpoint: **On** enables the blinking sequence; **Off** stops it and
-   turns the LED off. The blink timer must be interruptible so Off does not wait for a whole cycle.
-3. Persistent storage for pairing credentials and the Thread network configuration, plus a
-   deliberate factory-reset mechanism. Do not erase flash casually after pairing.
-4. A firmware-generated Matter setup code for **Home > + > Add Accessory**.
+| Binary | Purpose |
+| --- | --- |
+| `esp32-c6-starter` (default) | The existing, hardware-tested five-color blinking firmware |
+| `matter-thread` | Experimental Matter On/Off Light endpoint, BLE commissioning, and Thread transport |
+
+The second binary is in `src/bin/matter_thread.rs` and requires the opt-in `matter-thread` feature.
+Plain `cargo run --release` still selects the blinking firmware. Adding the networking code has
+not flashed or changed the firmware currently running on the board.
+
+The experimental binary allocates a 100 KiB heap for the radio/crypto dependencies, initializes
+hardware entropy for cryptography, and allocates the Matter stack statically rather than on
+the small execution stack. It uses the upstream example's development attestation credentials
+and volatile storage. These are for experiments, not a certified commercial accessory.
+
+**Important limitations:**
+
+- This is a **build-verified baseline**, not a hardware-tested or successfully commissioned accessory.
+- The On/Off endpoint currently uses the upstream test device logic; it does **not** control GPIO8.
+- Pairing and Thread configuration are **not persisted**. A restart loses them; any test pairing
+  must be removed from Apple Home before recommissioning. The experimental Thread address and
+  commissioning discriminator are regenerated on startup.
+- No factory-reset mechanism or custom device identity has been implemented.
+- The default blinking binary still has no Thread or Matter support.
+
+### Native build tools on macOS
+
+The networking stack includes C crypto dependencies. The build required CMake and a Clang with
+RISC-V support; Apple's system Clang on this machine does not include that target. These tools
+were installed with:
+
+```sh
+brew install cmake llvm
+```
+
+For the following commands, select Homebrew LLVM in the current terminal:
+
+```sh
+export PATH="$(brew --prefix llvm)/bin:$PATH"
+export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+```
+
+This does not change your shell configuration. Repeat the exports in a new terminal when building
+the experimental binary. The original blink-only build does not require these native build tools.
+
+Build without flashing:
+
+```sh
+cargo build --release --locked --features matter-thread --bin matter-thread
+```
+
+Check both binaries with the networking feature enabled:
+
+```sh
+cargo clippy --release --locked --features matter-thread --bins -- -D warnings
+```
+
+The experimental release build, the default blink release build, and the combined Clippy check
+passed on 2026-10-25. No Matter firmware was flashed or paired as part of this checkpoint.
+
+### Dependency compatibility
+
+This baseline keeps `esp-hal 1.2.2`, `esp-rtos 0.4.0`, and the current LED driver. It uses:
+
+- `esp-radio 1.0.0-beta.1` for BLE and IEEE 802.15.4 radio integration.
+- `rs-matter 0.4.1` and `rs-matter-stack 0.3.1`, resolved in `Cargo.lock`.
+- The [rs-matter-embassy Thread example revision](https://github.com/sysgrok/rs-matter-embassy/tree/2a806b0b1b521293b34a773618499e87402c843c/examples/esp),
+  pinned to commit `2a806b0b1b521293b34a773618499e87402c843c`.
+- [OpenThread Rust bindings](https://github.com/esp-rs/openthread/tree/b01e7e63a48943d060e971e7ea364a84609c7ffb),
+  pinned to commit `b01e7e63a48943d060e971e7ea364a84609c7ffb` for both `openthread` and `openthread-sys`.
+
+The upstream Embassy crate is not available as a usable release on crates.io yet. The selected
+Git revisions avoid relying on moving upstream branches or replacing the existing HAL with an
+experimental fork. `Cargo.lock` pins the remaining resolved dependencies. Logging consistently
+uses `defmt`; mixing the HAL's `log-04` and `defmt` features causes a build error.
+
+### Remaining checkpoints
+
+1. Replace the test light logic with an interruptible LED task: **On** enables the blinking
+   sequence; **Off** cancels the wait and turns the LED off promptly.
+2. Add persistent storage for pairing credentials and Thread configuration, a stable device
+   identity, and a deliberate factory-reset mechanism. Do not erase flash casually after pairing.
+3. Flash the experimental firmware explicitly, inspect startup and BLE commissioning logs,
+   obtain its Matter setup code, and pair through **Home > + > Add Accessory**.
    The board's serial number is not a Matter setup code.
+4. Verify Apple Home On/Off control and that pairing survives a power cycle.
 
-The [rs-matter-embassy project](https://github.com/sysgrok/rs-matter-embassy) provides a candidate
-ESP32-C6 Thread light integration. Its networking dependencies and flash-storage requirements
-still need to be checked against this project before adopting it. Development attestation
-credentials are for experiments, not a certified commercial accessory.
+Do not treat this first checkpoint as the finished Apple Home accessory. The normal
+`cargo run --release` command intentionally continues to flash the known-working blink example.
 
 References:
 
