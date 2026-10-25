@@ -2,9 +2,29 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "build-debug",
-            "command": "cargo build",
-            "type": "shell",
+            "label": "build-release",
+            "command": "cargo",
+            "args": ["build", "--release", "--locked"],
+            "type": "process",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": ["$rustc"]
+        },
+        {
+            "label": "clippy",
+            "command": "cargo",
+            "args": ["clippy", "--release", "--locked", "--bins", "--", "-D", "warnings"],
+            "type": "process",
+            "problemMatcher": ["$rustc"]
+        },
+        {
+            "label": "flash-and-monitor",
+            "command": "cargo",
+            "args": ["run", "--release", "--locked"],
+            "type": "process",
+            "problemMatcher": ["$rustc"]
         }
     ]
 }
