@@ -22,6 +22,8 @@ esp-backtrace = { version = "0.20.0", features = [
   "panic-handler",
 ] }
 esp-println = { version = "0.18.0", features = ["defmt-espflash", "esp32c6"] }
+smart-leds = "0.4.0"
+esp-hal-smartled = { version = "0.18.0", features = ["esp32c6"] }
 
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html

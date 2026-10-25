@@ -120,3 +120,48 @@ cargo run
 
 This command writes firmware to the connected board. The starter firmware logs "Hello world!" every
 500 milliseconds using `defmt`; the configured runner decodes that output. Press Ctrl+C to exit the monitor.
+
+### Command executed
+
+On 2026-10-25, I ran the firmware using the release profile:
+
+```sh
+cargo run --release
+```
+
+`--release` selects the release build profile configured in `Cargo.toml`, then uses the same
+`espflash` runner to flash the firmware and monitor its output.
+
+### Next step: add smart LED support
+
+I plan to run this from the repository root:
+
+```sh
+cargo add smart-leds
+```
+
+This adds `smart-leds` as a firmware dependency in `Cargo.toml` and updates `Cargo.lock`.
+The crate provides common color types and traits for smart LEDs; it does not by itself configure
+the ESP32-C6 hardware or drive an LED. That also requires a compatible driver and the correct board pin.
+
+### Add the ESP32-C6 smart LED driver
+
+On 2026-10-25, I added the RMT peripheral adapter for smart LEDs:
+
+```sh
+cargo add esp-hal-smartled@0.18.0 --features esp32c6
+```
+
+`esp-hal-smartled` connects the smart LED traits to the ESP32-C6's RMT peripheral, which generates
+the precisely timed pulses needed by supported addressable LEDs.
+Version `0.18.0` requires `esp-hal ~1.2`, which is compatible with this project's `esp-hal 1.2.2`.
+The `esp32c6` feature selects the chip; the existing `esp-hal` dependency enables the required unstable APIs.
+
+The command updates `Cargo.toml` and `Cargo.lock`. Adding the dependency does not change the running
+firmware: using it still requires initializing RMT, selecting the board's LED data pin, and writing LED colors.
+
+To check that the dependencies compile together without flashing the board:
+
+```sh
+cargo build
+```
