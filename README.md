@@ -59,6 +59,18 @@ In this target name, `riscv32imac` identifies the 32-bit RISC-V architecture and
 Installing the target does not select it for builds; the project's Cargo configuration or a
 `--target riscv32imac-unknown-none-elf` build option must do that.
 
+## Install the Espressif project generator
+
+`esp-generate` creates a Rust firmware project with chip-specific dependencies and build configuration.
+Unlike `cargo init`, it provides an embedded starting point rather than a desktop "Hello, world!" program.
+
+```sh
+cargo install esp-generate --locked
+```
+
+This installs the generator on the Mac; it does not create or modify a firmware project yet.
+`--locked` uses the generator's packaged dependency lockfile, but does not pin the version of `esp-generate` itself.
+
 ## Install debugging tools
 
 `probe-rs` can flash and debug supported microcontrollers through a compatible debug probe.
