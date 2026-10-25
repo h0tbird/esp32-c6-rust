@@ -162,6 +162,128 @@ The iPhone supplies the Thread dataset; no SSID/password or dataset needs to be 
 to the source. An already-paired board should reconnect using its existing Home
 accessory after an ordinary reset or firmware update.
 
+## Local control with chip-tool
+
+`chip-tool` is the official Matter SDK's command-line controller. It talks to the
+ESP32 through the local network and Thread border router: no USB connection or
+Thread radio in the Mac is required. The Mac still needs network reachability
+to the accessory. Installing the CLI alone does not authorize it to control the board.
+
+### Native Apple Silicon installation
+
+On this Mac, the SDK is checked out at `~/git/project-chip/connectedhomeip`, using
+tag `v1.6.1.0`. The compiled executable is `out/chip-tool/chip-tool`, with a symlink
+at `~/bin/chip-tool`. `~/bin` is already on this machine's PATH. Both the executable
+and the ZAP code-generation tool were verified as ARM64; Rosetta is not required.
+
+The SDK's downloaded ZAP was Intel-only. An official ARM64 ZAP release, `v2026.05.14`,
+was installed at `~/.local/opt/zap-v2026.05.14-arm64`. It meets the SDK's minimum
+ZAP version of `2026.5.12`. To rebuild with this native tool:
+
+```sh
+cd ~/git/project-chip/connectedhomeip
+source scripts/activate.sh
+export ZAP_INSTALL_PATH="$HOME/.local/opt/zap-v2026.05.14-arm64"
+ninja -C out/chip-tool
+```
+
+This assumes the SDK's Darwin submodules, environment, and build directory are
+already prepared. The existing binary does not need activation or the ZAP export
+just to run. Use `chip-tool` without arguments to list commands; this version does
+not support a global `--help` option.
+
+Avoid rerunning `scripts/examples/gn_build_example.sh` just to resume this build:
+at this SDK tag it prints the entire environment with `env`, potentially exposing
+tokens and passwords. Run Ninja directly and review logs before sharing them.
+
+References: [chip-tool guide](https://project-chip.github.io/connectedhomeip-doc/development_controllers/chip-tool/chip_tool_guide.html)
+and [ZAP ARM64 release](https://github.com/project-chip/zap/releases/tag/v2026.05.14).
+
+### Add the CLI without removing Apple Home
+
+Matter multi-admin lets Apple Home and chip-tool each have their own authorized
+fabric. Do not remove the Home accessory or factory-reset the board to add the CLI.
+
+1. Open the accessory's settings in Home and select **Turn On Pairing Mode**.
+   This worked from Home on the Mac in this setup; an iPhone can also provide it.
+2. Copy the new setup code shown by Home. Use it while the commissioning window
+   remains open, not the original boot-time code.
+3. Create a private, persistent directory for the CLI controller's credentials:
+
+   ```sh
+   mkdir -p "$HOME/.config/chip-tool"
+   chmod 700 "$HOME/.config/chip-tool"
+   ```
+
+4. Replace the placeholder below with the new code and run:
+
+   ```sh
+   chip-tool pairing code 1234 'NEW_CODE_FROM_HOME' \
+     --storage-directory "$HOME/.config/chip-tool" \
+     --paa-trust-store-path "$HOME/git/project-chip/connectedhomeip/credentials/development/paa-root-certs"
+   ```
+
+   The PAA directory contains development attestation trust roots for this test
+   accessory. Adjust its path if the SDK is elsewhere; do not bypass attestation
+   verification simply to avoid configuring the trust store.
+
+`1234` is the node ID assigned to this ESP32 in the CLI's fabric, not an Apple Home
+ID or the board's serial number. Wait for successful commissioning before sending
+commands. This setup is already paired as node `1234`; do not repeat pairing for
+normal use.
+
+Always use the same storage directory and default commissioner identity for the
+commands below. Without the directory option, this version defaults to temporary
+storage and may use a different controller identity. Keep the directory private,
+do not commit it, and do not delete it as routine cleanup: losing it loses the CLI's
+credentials, even though the board may retain that fabric. A setup code is not
+needed again for each command.
+
+### On, Off, and state
+
+Run these from any directory:
+
+```sh
+# On: start the five-color blinking sequence.
+chip-tool onoff on 1234 1 \
+  --storage-directory "$HOME/.config/chip-tool"
+
+# Off: stop blinking and clear the LED.
+chip-tool onoff off 1234 1 \
+  --storage-directory "$HOME/.config/chip-tool"
+
+# Read the actual Matter OnOff attribute.
+chip-tool onoff read on-off 1234 1 \
+  --storage-directory "$HOME/.config/chip-tool"
+```
+
+The final `1` is the LED's endpoint. A read reports `OnOff: TRUE` when the blinking
+sequence is enabled and `OnOff: FALSE` when disabled. The black intervals within
+the sequence do not change the logical OnOff attribute.
+
+On 2026-10-25, CLI commissioning completed successfully while preserving Apple Home.
+Off and On each returned `SUCCESS`; subsequent reads returned `FALSE` and `TRUE`,
+respectively. This verifies authenticated Matter commands independently of Home's UI,
+not optical LED output or long-term reliability.
+
+If a command times out, first check Thread coverage and the home hub. Use the same
+storage directory as commissioning and confirm the board still holds its pairing.
+Do not factory-reset or delete controller credentials as the first troubleshooting step.
+
+`CHIP Error 0x000000DB: The Resource is busy and cannot process the request`
+with a received Busy status during `CASE_Sigma1` means the accessory was reachable
+but could not accept secure-session setup at that moment. It is not an Off-command
+success or proof that pairing was lost. Each separate CLI process may establish a
+new secure session. The firmware's Busy responder advertises a 500 ms minimum retry
+delay when normal secure-channel handlers cannot accept the exchange in time; this
+does not guarantee the next attempt will succeed after exactly 500 ms.
+
+In a local test, an Off retry returned `SUCCESS`, an immediate read encountered Busy,
+and a subsequent read after a five-second pause returned `OnOff: FALSE`. For this
+idempotent On/Off/read workflow, wait a few seconds and retry rather than re-pairing.
+If Busy persists or frequently interferes with control, capture board-side session
+and responder logs to investigate resource pressure instead of retrying indefinitely.
+
 ## Persistence and factory reset
 
 The firmware validates the partition table and reserves the existing NVS partition
