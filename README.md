@@ -274,15 +274,65 @@ Do not factory-reset or delete controller credentials as the first troubleshooti
 with a received Busy status during `CASE_Sigma1` means the accessory was reachable
 but could not accept secure-session setup at that moment. It is not an Off-command
 success or proof that pairing was lost. Each separate CLI process may establish a
-new secure session. The firmware's Busy responder advertises a 500 ms minimum retry
-delay when normal secure-channel handlers cannot accept the exchange in time; this
-does not guarantee the next attempt will succeed after exactly 500 ms.
+new secure session. There are at least two relevant paths in the pinned Matter
+library that advertise the same 500 ms minimum retry delay:
 
-In a local test, an Off retry returned `SUCCESS`, an immediate read encountered Busy,
-and a subsequent read after a five-second pause returned `OnOff: FALSE`. For this
-idempotent On/Off/read workflow, wait a few seconds and retry rather than re-pairing.
-If Busy persists or frequently interferes with control, capture board-side session
-and responder logs to investigate resource pressure instead of retrying indefinitely.
+- The Busy responder handles exchanges not accepted by normal handlers in time.
+- The transport rejects a new unencrypted session when its session table is full,
+  sends Busy, and then attempts to evict an existing session. This can leave space
+  for the next attempt without accepting the original request.
+
+The advertised delay does not identify which path was taken or guarantee success
+after exactly 500 ms. Board-side logs confirmed the session-table path in this lab:
+after a normal reboot, eight separate CLI reads succeeded, then reads 9, 11, 13,
+and 15 failed with `No space for a new unencrypted session, sending Busy`.
+Reads 10, 12, and 14 succeeded. All successful reads reported `OnOff: FALSE`.
+The reboot preserved all three stored fabrics and the light setting.
+
+This distinguished session-table exhaustion from the delayed Busy responder.
+The original transport rejected the first request before attempting eviction, so a
+later request could succeed after a slot had been freed. Rebooting only cleared
+volatile sessions; increasing session limits would merely postpone exhaustion.
+
+The local `rs-matter` patch now queues the normal CloseSession notification in the
+separate TX buffer, evicts an eligible inactive session, and retries decoding the
+original plaintext handshake once. It preserves the received bytes, uses the
+existing eviction policy, and leaves encrypted-message and replay checks unchanged.
+Reserved sessions and sessions with active exchanges remain protected. If none can
+be evicted, Busy remains the correct response. Session limits are unchanged.
+
+After flashing the patch without erasing NVS, 32 consecutive independent CLI reads
+succeeded with no retries, followed by successful On/read-TRUE/Off/read-FALSE
+commands. All three fabrics and the LED settings were restored. This verifies the
+reproduced exhaustion case, not a guarantee that Busy can never occur under load.
+Redact Thread datasets before sharing board logs.
+
+### Reuse a session for repeated commands
+
+Interactive mode keeps the controller running and reuses an established secure
+session instead of opening a new one for every command:
+
+```sh
+chip-tool interactive start \
+  --storage-directory "$HOME/.config/chip-tool"
+```
+
+At its prompt, enter commands without the `chip-tool` prefix:
+
+```text
+onoff read on-off 1234 1
+onoff on 1234 1
+onoff off 1234 1
+quit
+```
+
+Before the admission patch, a six-read interactive test received Busy on its first
+read, succeeded on its second, and succeeded on the remaining four using the live
+controller session. All successful reads reported `OnOff: FALSE`; that test did not
+change the light state. Interactive mode remains useful for session reuse, but is
+no longer required to avoid the reproduced alternating-failure pattern.
+Legitimate Busy responses can still occur when resources are occupied. Persistent
+failures need diagnosis rather than re-pairing or endless retries.
 
 ## Persistence and factory reset
 
@@ -355,11 +405,27 @@ The ten tests cover the color sequence, Off/restart behavior, settings encoding,
 identity, preservation of Thread/fabric records, legacy migration, interrupted
 migration, failed writes, and rejection of invalid current records.
 
+Run the six local Matter session-admission regression tests:
+
+```sh
+cargo test --manifest-path vendor/rs-matter/Cargo.toml \
+  --locked --lib --no-default-features --features os,rustcrypto,log \
+  rx_session_admission --target aarch64-apple-darwin \
+  --target-dir target/host-tests
+```
+
+These exercise CASE and PASE admission with a full session table, preservation of
+the incoming packet and duplicate detection, active/reserved-session protection,
+the Busy status report when eviction is impossible, normal admission, and rejection
+of non-handshake or unknown encrypted-session traffic without eviction.
+
 Check formatting for both crates:
 
 ```sh
 cargo fmt --all -- --check
 cargo fmt --manifest-path tests/host/Cargo.toml -- --check
+rustfmt --check --edition 2021 --config skip_children=true \
+  vendor/rs-matter/src/transport.rs
 ```
 
 ## Troubleshooting
@@ -448,6 +514,7 @@ OpenThread's C++ rejection path, not more LED logs or a blanket Rust log-level c
 | `src/matter_light.rs` | Matter On/Off hooks, interruptible LED task and storage migration |
 | `src/lib.rs` | Shared light modules |
 | `tests/host/` | Native regression harness and its own dependency lockfile |
+| `vendor/rs-matter/` | Apache-2.0 rs-matter 0.4.1 with the local session-admission patch and regression tests |
 | `.cargo/` | Embedded target, serial runner and `DEFMT_LOG=info` |
 
 The firmware allocates a 100 KiB heap and a static Matter stack. Dependencies retain
@@ -460,6 +527,15 @@ the compatible `esp-hal 1.2.2`, `esp-rtos 0.4.0`, `esp-hal-smartled 0.18.0`, and
   at `2a806b0b1b521293b34a773618499e87402c843c`; its published placeholder is not a usable release.
 - [OpenThread bindings](https://github.com/esp-rs/openthread/tree/b01e7e63a48943d060e971e7ea364a84609c7ffb)
   at `b01e7e63a48943d060e971e7ea364a84609c7ffb` for both `openthread` and `openthread-sys`.
+
+Both the firmware and host-test manifests patch `rs-matter` to
+[`vendor/rs-matter`](vendor/rs-matter). It is the crates.io 0.4.1 package, whose
+upstream source revision is
+[`3f3528ef5c492b6feb0a2e043264dc47e9da4340`](https://github.com/project-chip/rs-matter/tree/3f3528ef5c492b6feb0a2e043264dc47e9da4340/rs-matter),
+with local changes confined to `src/transport.rs`. The upstream license and
+provenance metadata are retained. Vendoring makes the fix reproducible without
+editing Cargo's shared cache or upgrading unrelated dependencies. Reassess the
+patch when adopting an upstream release with equivalent admission behavior.
 
 Do not casually update these together with unrelated cleanup: newer upstream examples
 may require a different HAL integration. Earlier generator/blink milestones remain in

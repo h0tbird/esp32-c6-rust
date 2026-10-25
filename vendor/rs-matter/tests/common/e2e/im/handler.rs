@@ -1,0 +1,157 @@
+/*
+ *
+ *    Copyright (c) 2024-2026 Project CHIP Authors
+ *
+ *    Licensed under the Apache License, Version 2.0 (the "License");
+ *    you may not use this file except in compliance with the License.
+ *    You may obtain a copy of the License at
+ *
+ *        http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *    Unless required by applicable law or agreed to in writing, software
+ *    distributed under the License is distributed on an "AS IS" BASIS,
+ *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *    See the License for the specific language governing permissions and
+ *    limitations under the License.
+ */
+
+use rs_matter::crypto::{Crypto, Rng};
+use rs_matter::dm::clusters::app::level_control::LevelControlHooks;
+use rs_matter::dm::clusters::app::on_off::{
+    self, test::TestOnOffDeviceLogic, ClusterAsyncHandler as _, NoLevelControl, OnOffHandler,
+    OnOffHooks,
+};
+use rs_matter::dm::clusters::desc::{self, ClusterHandler as _, DescHandler};
+use rs_matter::dm::devices::{DEV_TYPE_ON_OFF_LIGHT, DEV_TYPE_ROOT_NODE};
+use rs_matter::dm::endpoints::{EthSysHandler, EthSysHandlerBuilder, ROOT_ENDPOINT_ID};
+use rs_matter::dm::{
+    Async, AsyncHandler, ChainedHandler, Dataver, EmptyHandler, Endpoint, FnMatcher,
+    HandlerContext, InvokeContext, InvokeReply, LifecycleOp, MatchContext, Metadata, Node,
+    ReadContext, ReadReply, WriteContext,
+};
+use rs_matter::error::Error;
+use rs_matter::{clusters, handler_chain_type};
+
+use crate::common::e2e::E2eRunner;
+
+use super::echo_cluster::{self, EchoHandler};
+
+/// A sample handler for E2E IM tests.
+pub struct E2eTestHandler<'a, OH: OnOffHooks, LH: LevelControlHooks>(
+    handler_chain_type!(
+        FnMatcher => on_off::HandlerAsyncAdaptor<OnOffHandler<'a, OH, LH>>,
+        FnMatcher => Async<EchoHandler>,
+        FnMatcher => Async<desc::HandlerAdaptor<DescHandler<'static>>>,
+        FnMatcher => Async<EchoHandler>
+        | EthSysHandler<'a>),
+);
+
+impl<'a, OH: OnOffHooks, LH: LevelControlHooks> E2eTestHandler<'a, OH, LH> {
+    pub const NODE: Node<'static> = Node {
+        endpoints: &[
+            Endpoint::new(
+                0,
+                &[DEV_TYPE_ROOT_NODE],
+                clusters!(eth; echo_cluster::CLUSTER),
+            ),
+            Endpoint::new(
+                1,
+                &[DEV_TYPE_ON_OFF_LIGHT],
+                clusters!(
+                    DescHandler::CLUSTER,
+                    OnOffHandler::<'_, TestOnOffDeviceLogic, NoLevelControl>::CLUSTER,
+                    echo_cluster::CLUSTER,
+                ),
+            ),
+        ],
+    };
+
+    pub fn new(mut rand: impl Rng + Copy, on_off: on_off::OnOffHandler<'a, OH, LH>) -> Self {
+        let handler = EthSysHandlerBuilder::new()
+            .build(rand)
+            .chain(
+                |e, c| e == ROOT_ENDPOINT_ID && c == echo_cluster::ID,
+                Async(EchoHandler::new(2, Dataver::new_rand(&mut rand))),
+            )
+            .chain(
+                |e, c| e == 1 && c == DescHandler::CLUSTER.id,
+                Async(DescHandler::new(Dataver::new_rand(&mut rand)).adapt()),
+            )
+            .chain(
+                |e, c| e == 1 && c == echo_cluster::ID,
+                Async(EchoHandler::new(3, Dataver::new_rand(&mut rand))),
+            )
+            .chain(
+                |e, c| e == 1 && c == TestOnOffDeviceLogic::CLUSTER.id,
+                on_off::HandlerAsyncAdaptor(on_off),
+            );
+
+        Self(handler)
+    }
+
+    pub fn echo_cluster(&self, endpoint: u16) -> &EchoHandler {
+        match endpoint {
+            0 => &self.0.next.next.next.handler.0,
+            1 => &self.0.next.handler.0,
+            _ => panic!(),
+        }
+    }
+}
+
+impl<'a, OH: OnOffHooks, LH: LevelControlHooks> AsyncHandler for E2eTestHandler<'a, OH, LH> {
+    fn read_awaits(&self, _ctx: impl ReadContext) -> bool {
+        false
+    }
+
+    fn write_awaits(&self, _ctx: impl WriteContext) -> bool {
+        false
+    }
+
+    fn invoke_awaits(&self, _ctx: impl InvokeContext) -> bool {
+        false
+    }
+
+    async fn read(&self, ctx: impl ReadContext, reply: impl ReadReply) -> Result<(), Error> {
+        self.0.read(ctx, reply).await
+    }
+
+    async fn write(&self, ctx: impl WriteContext) -> Result<(), Error> {
+        self.0.write(ctx).await
+    }
+
+    async fn invoke(&self, ctx: impl InvokeContext, reply: impl InvokeReply) -> Result<(), Error> {
+        self.0.invoke(ctx, reply).await
+    }
+
+    fn bump_dataver(&self, ctx: impl MatchContext) {
+        self.0.bump_dataver(ctx)
+    }
+
+    fn lifecycle(&self, ctx: impl HandlerContext, op: LifecycleOp) -> Result<(), Error> {
+        self.0.lifecycle(ctx, op)
+    }
+}
+
+impl<'a, OH: OnOffHooks, LH: LevelControlHooks> Metadata for E2eTestHandler<'a, OH, LH> {
+    fn access<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&Node<'_>) -> R,
+    {
+        f(&Self::NODE)
+    }
+}
+
+impl<C: Crypto> E2eRunner<C> {
+    // For backwards compatibility
+    pub fn handler(&self) -> E2eTestHandler<'_, TestOnOffDeviceLogic, NoLevelControl> {
+        let mut rand = self.crypto.rand().unwrap();
+
+        let on_off_handler = on_off::OnOffHandler::new_standalone(
+            Dataver::new_rand(&mut rand),
+            1,
+            TestOnOffDeviceLogic::new(false),
+        );
+
+        E2eTestHandler::new(rand, on_off_handler)
+    }
+}

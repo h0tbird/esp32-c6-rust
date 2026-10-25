@@ -44,6 +44,7 @@ static_cell = "2"
 tinyrlibc = { version = "0.5", default-features = false, features = ["memchr", "utoa", "strtoul"] }
 
 [patch.crates-io]
+rs-matter = { path = "vendor/rs-matter" }
 openthread = { git = "https://github.com/esp-rs/openthread", rev = "b01e7e63a48943d060e971e7ea364a84609c7ffb" }
 openthread-sys = { git = "https://github.com/esp-rs/openthread", rev = "b01e7e63a48943d060e971e7ea364a84609c7ffb" }
 

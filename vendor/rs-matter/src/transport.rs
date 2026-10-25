@@ -1,0 +1,3337 @@
+/*
+ *
+ *    Copyright (c) 2022-2026 Project CHIP Authors
+ *
+ *    Licensed under the Apache License, Version 2.0 (the "License");
+ *    you may not use this file except in compliance with the License.
+ *    You may obtain a copy of the License at
+ *
+ *        http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *    Unless required by applicable law or agreed to in writing, software
+ *    distributed under the License is distributed on an "AS IS" BASIS,
+ *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *    See the License for the specific language governing permissions and
+ *    limitations under the License.
+ */
+
+use core::fmt::{self, Display};
+use core::future::Future;
+use core::num::NonZeroU8;
+use core::ops::{Deref, DerefMut};
+use core::pin::pin;
+
+use domain::base::name::ToLabelIter;
+
+#[cfg(feature = "groups")]
+use embassy_futures::select::select4;
+use embassy_futures::select::{select, select3, Either};
+use embassy_time::{Duration, Timer};
+
+use rand_core::Rng;
+
+use crate::crypto::Crypto;
+use crate::dm::clusters::basic_info::BasicInfoConfig;
+use crate::dm::NodeId;
+use crate::error::{Error, ErrorCode};
+#[cfg(feature = "groups")]
+use crate::fabric::{MAX_FABRICS, MAX_GROUPS_PER_FABRIC};
+use crate::fmt::Bytes;
+use crate::im::PROTO_ID_INTERACTION_MODEL;
+#[cfg(not(feature = "case-responder-only"))]
+use crate::sc::case::CaseInitiator;
+use crate::sc::pase::PaseInitiator;
+#[cfg(not(feature = "case-responder-only"))]
+use crate::sc::SessionParameters;
+use crate::sc::{sc_write, OpCode, SCStatusCodes, StatusReport, PROTO_ID_SECURE_CHANNEL};
+use crate::tlv::TLVElement;
+use crate::transport::network::mdns::{
+    commissionable_instance_id, merge_resolve_candidate, score_ip_address,
+    score_ip_address_on_link, BrowseExclude, CommissionableFilter, MdnsBrowseState,
+    MdnsRemoteService, MdnsResolveState, ResolvedAddr, ResolvedNode, MAX_RESOLVE_CANDIDATES,
+};
+use crate::transport::network::{MatterRemoteService, NetworkMulticast};
+use crate::utils::cell::RefCell;
+use crate::utils::init::{init, Init};
+#[cfg(feature = "groups")]
+use crate::utils::ipv6::compute_group_multicast_addr;
+use crate::utils::select::Coalesce;
+use crate::utils::storage::Vec;
+use crate::utils::storage::{pooled::Buffers, ParseBuf, WriteBuf};
+
+use crate::utils::sync::blocking::Mutex;
+use crate::utils::sync::{IfMutex, IfMutexGuard, Notification, Signal};
+use crate::{Matter, MATTER_PORT};
+
+use exchange::{Exchange, ExchangeId, ExchangeState, MessageMeta, ResponderState, Role};
+use network::{Address, IpAddr, Ipv6Addr, NetworkReceive, NetworkSend, SocketAddr, SocketAddrV6};
+use packet::PacketHdr;
+use proto_hdr::ProtoHdr;
+use session::{Session, Sessions};
+
+use self::mrp::mrp_log;
+
+mod dedup;
+
+pub mod exchange;
+pub mod mrp;
+pub mod network;
+pub mod packet;
+pub mod plain_hdr;
+pub mod proto_hdr;
+pub mod session;
+
+pub const MATTER_SOCKET_BIND_ADDR: SocketAddr =
+    SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, MATTER_PORT, 0, 0));
+
+#[cfg(feature = "groups")]
+const MAX_GROUP_ADDRS: usize = MAX_FABRICS * MAX_GROUPS_PER_FABRIC + 1; // +1 for the IANA-assigned Groupcast address
+/// Without multicast group support no group addresses are ever joined, so the
+/// join-list is zero-capacity. Keeping the field (rather than gating it) avoids
+/// splitting the in-place `Transport` initializer, and a `Vec<_, 0>` costs no
+/// RAM.
+#[cfg(not(feature = "groups"))]
+const MAX_GROUP_ADDRS: usize = 0;
+
+const ACCEPT_TIMEOUT_MS: u64 = 1000;
+
+#[cfg(feature = "large-buffers")]
+pub(crate) const MAX_RX_BUF_SIZE: usize = network::MAX_RX_LARGE_PACKET_SIZE;
+#[cfg(feature = "large-buffers")]
+pub(crate) const MAX_TX_BUF_SIZE: usize = network::MAX_TX_LARGE_PACKET_SIZE;
+
+#[cfg(not(feature = "large-buffers"))]
+pub(crate) const MAX_RX_BUF_SIZE: usize = network::MAX_RX_PACKET_SIZE;
+#[cfg(not(feature = "large-buffers"))]
+pub(crate) const MAX_TX_BUF_SIZE: usize = network::MAX_TX_PACKET_SIZE;
+
+/// The maximum application payload of an incoming (RX) packet, i.e. the RX buffer
+/// minus the two packet headers (plain + protocol) and the trailing AEAD tag.
+pub const MAX_RX_PAYLOAD_SIZE: usize =
+    MAX_RX_BUF_SIZE - PacketHdr::HDR_RESERVE - PacketHdr::TAIL_RESERVE;
+
+/// The maximum application payload of an outgoing (TX) packet, i.e. the TX buffer
+/// minus the two packet headers (plain + protocol) and the trailing AEAD tag.
+pub const MAX_TX_PAYLOAD_SIZE: usize =
+    MAX_TX_BUF_SIZE - PacketHdr::HDR_RESERVE - PacketHdr::TAIL_RESERVE;
+
+/// Represents the state of the transport layer of a `Matter` instance.
+pub struct Transport {
+    /// Buffer for an incoming (RX) packet.
+    // TODO XXX FIXME: Needs multiple wakers for work-stealing executors
+    rx: IfMutex<Packet<MAX_RX_BUF_SIZE>>,
+    /// Buffer for an outgoing (TX) packet.
+    // TODO XXX FIXME: Needs multiple wakers for work-stealing executors
+    tx: IfMutex<Packet<MAX_TX_BUF_SIZE>>,
+    /// List of currently joined group addresses, used for managing multicast group membership.
+    /// Zero-capacity (and thus never populated) without the `groups` feature.
+    group_addrs: IfMutex<Vec<Ipv6Addr, MAX_GROUP_ADDRS>>,
+    /// Notification for when an exchange is dropped.
+    exchange_dropped: Notification,
+    /// A notification that the Matter mDNS services might have changed
+    mdns_changed: Notification,
+    /// The single in-flight mDNS resolve rendezvous, shared between [`Transport::resolve`]
+    /// callers and the running mDNS responder.
+    mdns_resolve: Signal<MdnsResolveState>,
+    /// The single in-flight mDNS commissionable-browse rendezvous, shared between
+    /// [`Transport::browse_commissionable`] callers and the running mDNS responder.
+    mdns_browse: Signal<MdnsBrowseState>,
+    /// A notification that a session had been removed
+    session_removed: Notification,
+    /// A notification that the groups have been modified.
+    /// Unused without the `groups` feature, but kept unconditionally so the
+    /// in-place `Transport` initializer needs no feature-specific variant.
+    #[cfg_attr(not(feature = "groups"), allow(dead_code))]
+    groups_modified: Notification,
+    /// A notification that the CASE session resumption cache has been
+    /// mutated and should be re-persisted by the background persist
+    /// task (see [`crate::Matter::run_persist_resumption`]).
+    ///
+    /// Kept as a field unconditionally (a zero-cost `Notification`) so the
+    /// `new`/`init` constructors need no `case-resumption`-specific variant;
+    /// only the notify/wait accessors are gated.
+    #[cfg_attr(not(feature = "case-resumption"), allow(dead_code))]
+    resumption_dirty: Notification,
+    /// Counters for the messages crossing this node.
+    counters: Mutex<RefCell<MessageCounters>>,
+    /// Device SAI (Secure Association Identifier)
+    device_sai: Option<u32>,
+    /// Device SII (Secure Identity Identifier)
+    device_sii: Option<u32>,
+}
+
+impl Transport {
+    /// Create a new `Transport` with empty RX and TX buffers, and the given device SAI/SII.
+    #[inline(always)]
+    pub(crate) const fn new(dev_det: &BasicInfoConfig<'_>) -> Self {
+        Self {
+            rx: IfMutex::new(Packet::new()),
+            tx: IfMutex::new(Packet::new()),
+            group_addrs: IfMutex::new(Vec::new()),
+            exchange_dropped: Notification::new(),
+            mdns_changed: Notification::new(),
+            mdns_resolve: Signal::new(MdnsResolveState::Idle),
+            mdns_browse: Signal::new(MdnsBrowseState::Idle),
+            session_removed: Notification::new(),
+            groups_modified: Notification::new(),
+            resumption_dirty: Notification::new(),
+            counters: Mutex::new(RefCell::new(MessageCounters::new())),
+            device_sai: dev_det.sai,
+            device_sii: dev_det.sii,
+        }
+    }
+
+    /// Initialize the transport state by initializing the RX and TX buffers, and setting up the exchange dropped notification.
+    pub(crate) fn init<'m>(dev_det: &'m BasicInfoConfig<'m>) -> impl Init<Self> + 'm {
+        init!(Self {
+            rx <- IfMutex::init(Packet::init()),
+            tx <- IfMutex::init(Packet::init()),
+            group_addrs <- IfMutex::init(Vec::init()),
+            exchange_dropped <- Notification::init(),
+            mdns_changed <- Notification::init(),
+            mdns_resolve <- Signal::init(MdnsResolveState::Idle),
+            mdns_browse <- Signal::init(MdnsBrowseState::Idle),
+            session_removed <- Notification::init(),
+            groups_modified <- Notification::init(),
+            resumption_dirty <- Notification::init(),
+            counters <- Mutex::init(RefCell::init(MessageCounters::new())),
+            device_sai: dev_det.sai,
+            device_sii: dev_det.sii,
+        })
+    }
+
+    /// Reset the transport state by clearing the RX buffer and the TX buffer
+    /// NOTE: User should be careful _not_ to call this method while the transport layer and/or the built-in mDNS is running.
+    pub fn reset(&self) -> Result<(), Error> {
+        self.rx
+            .try_lock()
+            .map_err(|_| ErrorCode::InvalidState)?
+            .buf
+            .clear();
+        self.tx
+            .try_lock()
+            .map_err(|_| ErrorCode::InvalidState)?
+            .buf
+            .clear();
+
+        Ok(())
+    }
+
+    /// Return a reference to the transport RX buffer.
+    ///
+    /// Useful when external code (like i.e. a user-provided mDNS implementation)
+    /// needs an RX buffer.
+    pub fn rx_buffer(&self) -> PacketBufferExternalAccess<'_, MAX_RX_BUF_SIZE> {
+        PacketBufferExternalAccess(&self.rx)
+    }
+
+    /// Return a reference to the transport TX buffer.
+    ///
+    /// Useful when external code (like i.e. a user-provided mDNS implementation)
+    /// needs a TX buffer.
+    pub fn tx_buffer(&self) -> PacketBufferExternalAccess<'_, MAX_TX_BUF_SIZE> {
+        PacketBufferExternalAccess(&self.tx)
+    }
+
+    /// Notify that the Matter mDNS services _might_ have changed.
+    pub(crate) fn notify_mdns_changed(&self) {
+        self.mdns_changed.notify();
+    }
+
+    /// A hook for user code to wait for notification that the Matter mDNS services might have changed.
+    ///
+    /// Once this future resolves, user code is supposed to inspect the mDNS services for changes, and
+    /// if there are changes, re-publish the changed mDNS services in an mDNS responder accordingly.
+    pub fn wait_mdns(&self) -> impl Future<Output = ()> + '_ {
+        self.mdns_changed.wait()
+    }
+
+    /// Notify that groups have changed (keys, key maps, or membership) and
+    /// multicast registrations need updating.
+    #[cfg(feature = "groups")]
+    pub(crate) fn notify_groups_changed(&self) {
+        self.groups_modified.notify();
+    }
+
+    /// Wait until the groups have changed (see [`Transport::notify_groups_changed`]).
+    #[cfg(feature = "groups")]
+    fn wait_groups_changed(&self) -> impl Future<Output = ()> + '_ {
+        self.groups_modified.wait()
+    }
+
+    /// The message counters of this node.
+    pub fn counters(&self) -> MessageCounters {
+        self.counters.lock(|counters| counters.borrow().clone())
+    }
+
+    /// Notify that a session has been removed.
+    pub(crate) fn notify_session_removed(&self) {
+        self.session_removed.notify();
+    }
+
+    /// Wait until a session has been removed (see [`Transport::notify_session_removed`]).
+    pub(crate) fn wait_session_removed(&self) -> impl Future<Output = ()> + '_ {
+        self.session_removed.wait()
+    }
+
+    /// Notify that the CASE session resumption cache was mutated and
+    /// should be re-persisted. Fired from every code path that inserts,
+    /// rotates or evicts a [`crate::sc::case::ResumableSession`].
+    #[cfg(feature = "case-resumption")]
+    pub(crate) fn notify_resumption_dirty(&self) {
+        self.resumption_dirty.notify();
+    }
+
+    /// Wait until the CASE session resumption cache has been mutated
+    /// (see [`Transport::notify_resumption_dirty`]). Used by the
+    /// [`crate::Matter::run_persist_resumption`] background task to
+    /// know when to flush the cache to storage.
+    #[cfg(feature = "case-resumption")]
+    pub(crate) fn wait_resumption_dirty(&self) -> impl Future<Output = ()> + '_ {
+        self.resumption_dirty.wait()
+    }
+
+    /// Resolve a Matter service instance's address over mDNS.
+    ///
+    /// Places a single resolve request into the shared rendezvous and waits up
+    /// to `timeout_ms` for the running mDNS responder to fire the query and
+    /// deposit a service answer. Multiple concurrent callers serialize: each waits for
+    /// any in-flight resolve to finish before placing its own.
+    ///
+    /// Returns [`ErrorCode::NotFound`] if no service answer arrives within the timeout.
+    /// If this future is dropped before completing, the rendezvous is reset so
+    /// other callers can proceed.
+    ///
+    /// Requires a running mDNS responder (e.g. `BuiltinMdns::run`) to
+    /// service the request; without one, every resolve will time out.
+    async fn resolve(
+        &self,
+        service: MatterRemoteService,
+        timeout_ms: u32,
+    ) -> Result<ResolvedNode, Error> {
+        // 1. Serialize with other resolvers and place the request.
+        self.mdns_resolve
+            .wait(|state| {
+                if matches!(state, MdnsResolveState::Idle) {
+                    *state = MdnsResolveState::Requested {
+                        service: service.clone(),
+                    };
+                    Some(())
+                } else {
+                    None
+                }
+            })
+            .await;
+
+        // 2. Ensure the slot is released if this future is dropped (or times out).
+        let mut guard = MdnsResolveGuard {
+            signal: &self.mdns_resolve,
+            armed: true,
+        };
+
+        // 3. Wait for the responder to deposit our answer, or time out.
+        let mut wait = pin!(self.mdns_resolve.wait(|state| match state {
+            MdnsResolveState::Resolved {
+                addrs,
+                port,
+                tcp_capable,
+                sii,
+                sai,
+                sat,
+            } => {
+                let mut node = ResolvedNode {
+                    addrs: Vec::new(),
+                    tcp_capable: *tcp_capable,
+                    sii: *sii,
+                    sai: *sai,
+                    sat: *sat,
+                };
+
+                for candidate in addrs.iter() {
+                    let _ = node.addrs.push(Self::scoped_socket_addr(
+                        candidate.ip,
+                        *port,
+                        candidate.scope_id,
+                    ));
+                }
+
+                *state = MdnsResolveState::Idle;
+                Some(node)
+            }
+            _ => None,
+        }));
+
+        let mut timer = pin!(Timer::after(Duration::from_millis(timeout_ms as u64)));
+
+        match select(&mut wait, &mut timer).await {
+            Either::First(node) => {
+                // The `wait` above already reset the slot to `Idle`.
+                guard.armed = false;
+
+                Ok(node)
+            }
+            Either::Second(_) => Err(ErrorCode::NotFound.into()),
+        }
+    }
+
+    /// Responder-side: await the next pending mDNS resolve request, marking it
+    /// in-flight.
+    ///
+    /// Part of the public responder contract: a third-party mDNS responder
+    /// (living outside this crate) drives the resolve use case by awaiting a
+    /// request here, issuing its own query, and depositing any answers via
+    /// [`Transport::try_deposit_mdns_resolve`].
+    pub async fn wait_mdns_resolve_request(&self) -> MatterRemoteService {
+        self.mdns_resolve
+            .wait(|state| match state {
+                MdnsResolveState::Requested { service } => {
+                    let service = service.clone();
+                    *state = MdnsResolveState::InFlight {
+                        service: service.clone(),
+                    };
+                    Some(service)
+                }
+                _ => None,
+            })
+            .await
+    }
+
+    /// Whether an operational resolve is currently in flight.
+    ///
+    /// Used by mDNS implementations to poll-drive their resolve
+    /// loop only while a request is outstanding.
+    #[allow(dead_code)]
+    pub fn mdns_resolve_in_flight(&self) -> bool {
+        self.mdns_resolve
+            .modify(|state| (false, matches!(state, MdnsResolveState::InFlight { .. })))
+    }
+
+    /// Deposit a discovered [`MdnsRemoteService`] against an in-flight resolve
+    /// request, transitioning it to `Resolved` if the answer's instance name
+    /// matches. Best-effort: a non-matching, address-less, or absent request is
+    /// a no-op.
+    ///
+    /// The single resolve-deposit entry point shared by the builtin parser, the
+    /// OS-backed responders, and any third-party responder - all hand it an
+    /// [`MdnsRemoteService`] (the builtin lazily over the packet, the others over
+    /// their native records).
+    ///
+    /// `local_ipv6` are the IPv6 addresses of the interface the responder is
+    /// running on; they let an on-link peer address outrank an off-link one of
+    /// the same kind (see [`score_ip_address_on_link`]). Pass `&[]` when they are
+    /// not known - the OS-backed responders delegate the host records to a daemon
+    /// and never see them.
+    pub fn try_deposit_mdns_resolve<'a, I, A, T>(
+        &self,
+        answer: &MdnsRemoteService<I, A, T>,
+        local_ipv6: &[Ipv6Addr],
+    ) where
+        I: ToLabelIter,
+        A: Iterator<Item = IpAddr> + Clone,
+        T: Iterator<Item = (&'a str, &'a str)> + Clone,
+    {
+        let Some(port) = answer.port else {
+            return;
+        };
+        let scope_id = answer.scope_id;
+
+        let (sii, sai, sat) = answer.session_params();
+        let tcp_capable = answer.supports_tcp_server();
+
+        let candidates = || {
+            answer.addrs.clone().map(move |ip| ResolvedAddr {
+                ip,
+                scope_id,
+                score: score_ip_address_on_link(&ip, local_ipv6),
+            })
+        };
+
+        self.mdns_resolve.modify(|state| match state {
+            MdnsResolveState::InFlight { service }
+                if service.matches_instance(&answer.instance_name) =>
+            {
+                let mut addrs = Vec::new();
+
+                for candidate in candidates() {
+                    merge_resolve_candidate(&mut addrs, candidate);
+                }
+
+                if addrs.is_empty() {
+                    // An address-less answer (e.g. a PTR-only record) leaves the
+                    // request in flight for a later, complete one.
+                    return (false, ());
+                }
+
+                *state = MdnsResolveState::Resolved {
+                    addrs,
+                    port,
+                    tcp_capable,
+                    sii,
+                    sai,
+                    sat,
+                };
+                (true, ())
+            }
+            // Already resolved (same in-flight target — the rendezvous is
+            // single-slot) but not yet consumed: merge the new addresses into the
+            // ranked list, so a backend that surfaces one address per callback
+            // (zeroconf, Avahi) still ends up with alternatives to fall back to,
+            // and a later IPv6 deposit still outranks an earlier IPv4 one.
+            //
+            // Preserve any session params already resolved: a per-address deposit
+            // may carry no TXT (e.g. zeroconf's `ServiceDiscovery.txt` is
+            // optional and can arrive only on a different callback than the
+            // address), in which case `sii`/`sai`/`sat` are `None` here and would
+            // otherwise clobber the good values from the earlier deposit.
+            MdnsResolveState::Resolved {
+                addrs,
+                tcp_capable: cur_tcp,
+                sii: cur_sii,
+                sai: cur_sai,
+                sat: cur_sat,
+                ..
+            } => {
+                let mut changed = false;
+
+                // A later deposit may be the one carrying the TXT (some backends
+                // surface addresses and TXT on separate callbacks), so an
+                // advertised capability is latched, never cleared.
+                *cur_tcp |= tcp_capable;
+
+                for candidate in candidates() {
+                    changed |= merge_resolve_candidate(addrs, candidate);
+                }
+
+                *cur_sii = cur_sii.or(sii);
+                *cur_sai = cur_sai.or(sai);
+                *cur_sat = cur_sat.or(sat);
+
+                (changed, ())
+            }
+            _ => (false, ()),
+        });
+    }
+
+    /// Browse the mDNS network for a **commissionable** node matching `filter`,
+    /// returning the first match's address and commissionable instance id.
+    ///
+    /// Places a single browse request into the shared rendezvous and waits up to
+    /// `timeout_ms` for the running mDNS responder to fire the browse query and
+    /// deposit the first node whose advertisement matches **all** non-`None`
+    /// fields of `filter` (see [`CommissionableFilter::matches`]) and whose
+    /// commissionable instance id is **not** in `exclude`. Multiple concurrent
+    /// callers serialize.
+    ///
+    /// `exclude` is how a caller steps to the **next** candidate when several
+    /// nodes share a (short) discriminator: pass the ids already tried (PASE
+    /// failed), and the next un-tried match is returned; repeat until
+    /// [`ErrorCode::NotFound`] (exhausted). Pass `&[]` for the first attempt.
+    /// At most [`MAX_BROWSE_EXCLUDE`](crate::transport::network::mdns) ids - more
+    /// returns [`ErrorCode::ResourceExhausted`].
+    ///
+    /// Returns `(address, commissionable_instance_id)` - the address can be fed
+    /// straight into [`Transport::initiate_pase`] to start PASE. Returns
+    /// [`ErrorCode::NotFound`] on timeout; the rendezvous is reset if this future
+    /// is dropped.
+    ///
+    /// Requires a running mDNS responder (e.g. `BuiltinMdns::run`).
+    ///
+    // TODO: A BLE/BTP equivalent is needed to discover wireless devices that
+    // advertise commissionable over BLE rather than mDNS - future work.
+    pub async fn browse_commissionable(
+        &self,
+        filter: &CommissionableFilter,
+        exclude: &[u64],
+        timeout_ms: u32,
+    ) -> Result<(Address, u64), Error> {
+        let mut exclude_vec = BrowseExclude::new();
+        exclude_vec
+            .extend_from_slice(exclude)
+            .map_err(|_| ErrorCode::ResourceExhausted)?;
+
+        // 1. Serialize with other browsers and place the request.
+        self.mdns_browse
+            .wait(|state| {
+                if matches!(state, MdnsBrowseState::Idle) {
+                    *state = MdnsBrowseState::Requested {
+                        filter: filter.clone(),
+                        exclude: exclude_vec.clone(),
+                    };
+                    Some(())
+                } else {
+                    None
+                }
+            })
+            .await;
+
+        // 2. Release the slot if this future is dropped (or times out).
+        let mut guard = MdnsBrowseGuard {
+            signal: &self.mdns_browse,
+            armed: true,
+        };
+
+        // 3. Wait for the first matching, non-excluded commissionable node, or time out.
+        let mut wait = pin!(self.mdns_browse.wait(|state| match state {
+            MdnsBrowseState::Found {
+                ip,
+                port,
+                scope_id,
+                id,
+            } => {
+                let found = (
+                    Address::Udp(Self::scoped_socket_addr(*ip, *port, *scope_id)),
+                    *id,
+                );
+                *state = MdnsBrowseState::Idle;
+                Some(found)
+            }
+            _ => None,
+        }));
+
+        let mut timer = pin!(Timer::after(Duration::from_millis(timeout_ms as u64)));
+
+        match select(&mut wait, &mut timer).await {
+            Either::First(found) => {
+                guard.armed = false;
+
+                Ok(found)
+            }
+            Either::Second(_) => Err(ErrorCode::NotFound.into()),
+        }
+    }
+
+    /// Responder-side: await the next pending mDNS browse request, marking it
+    /// in-flight. Returns the filter to query for (the exclude set is consulted
+    /// later, at deposit time).
+    ///
+    /// Part of the public responder contract: a third-party mDNS responder
+    /// (living outside this crate) drives the commissionable-browse use case by
+    /// awaiting a request here, issuing its own query, and depositing matches via
+    /// [`Transport::try_deposit_mdns_browse`].
+    pub async fn wait_mdns_browse_request(&self) -> CommissionableFilter {
+        self.mdns_browse
+            .wait(|state| match state {
+                MdnsBrowseState::Requested { filter, exclude } => {
+                    let filter = filter.clone();
+                    *state = MdnsBrowseState::InFlight {
+                        filter: filter.clone(),
+                        exclude: core::mem::take(exclude),
+                    };
+
+                    Some(filter)
+                }
+                _ => None,
+            })
+            .await
+    }
+
+    /// Whether a commissionable browse is currently in flight.
+    ///
+    /// Used by mDNS implementations to poll-drive their browse
+    /// loop only while a request is outstanding.
+    #[allow(dead_code)]
+    pub fn mdns_browse_in_flight(&self) -> bool {
+        self.mdns_browse
+            .modify(|state| (false, matches!(state, MdnsBrowseState::InFlight { .. })))
+    }
+
+    /// Deposit a discovered [`MdnsRemoteService`] against an in-flight browse
+    /// request, transitioning it to `Found` if the instance is not excluded and
+    /// its TXT records match the filter. Best-effort: a non-matching, excluded,
+    /// address-less, or absent request is a no-op.
+    ///
+    /// The single browse-deposit entry point shared by the builtin parser, the
+    /// OS-backed responders, and any third-party responder - all hand it an
+    /// [`MdnsRemoteService`].
+    pub fn try_deposit_mdns_browse<'a, I, A, T>(&self, answer: &MdnsRemoteService<I, A, T>)
+    where
+        I: ToLabelIter,
+        A: Iterator<Item = IpAddr> + Clone,
+        T: Iterator<Item = (&'a str, &'a str)> + Clone,
+    {
+        let Some(id) = commissionable_instance_id(&answer.instance_name) else {
+            return;
+        };
+        let Some(ip) = answer.addrs.clone().max_by_key(score_ip_address) else {
+            return;
+        };
+        let Some(port) = answer.port else {
+            return;
+        };
+        let scope_id = answer.scope_id;
+
+        self.mdns_browse.modify(|state| match state {
+            MdnsBrowseState::InFlight { filter, exclude }
+                if !exclude.contains(&id) && filter.matches(answer) =>
+            {
+                *state = MdnsBrowseState::Found {
+                    ip,
+                    port,
+                    scope_id,
+                    id,
+                };
+                (true, ())
+            }
+            // Already matched this same instance but not yet consumed: keep the
+            // better-scoring address. Backends that surface one address per
+            // family at a time (e.g. zeroconf fires a callback per A/AAAA record)
+            // can thus still yield the preferred IPv6 address even if the IPv4
+            // one was deposited first.
+            MdnsBrowseState::Found {
+                ip: cur_ip,
+                id: cur_id,
+                ..
+            } if *cur_id == id && score_ip_address(&ip) > score_ip_address(cur_ip) => {
+                *state = MdnsBrowseState::Found {
+                    ip,
+                    port,
+                    scope_id,
+                    id,
+                };
+                (true, ())
+            }
+            _ => (false, ()),
+        });
+    }
+
+    pub(crate) async fn accept_if<'a, F>(
+        &self,
+        matter: &'a Matter<'a>,
+        mut f: F,
+    ) -> Result<Exchange<'a>, Error>
+    where
+        F: FnMut(&Session, &ExchangeState, &Packet<MAX_RX_BUF_SIZE>) -> bool,
+    {
+        let exchange = self
+            .rx
+            .with(|packet| {
+                matter.with_state(|state| {
+                    let session = state
+                        .sessions
+                        .get_for_rx(&packet.peer, &packet.header.plain)?;
+                    let exch_index = session.get_exch_for_rx(&packet.header.proto)?;
+
+                    let matches = {
+                        // `unwrap` is safe because the transport code is single threaded, and since we don't `await`
+                        // after computing `exch_index` no code can remove the exchange from the session
+                        let exch = unwrap!(session.exchanges[exch_index].as_ref());
+
+                        matches!(exch.role, Role::Responder(ResponderState::AcceptPending))
+                            && f(session, exch, packet)
+                    };
+
+                    if !matches {
+                        return None;
+                    }
+
+                    // `unwrap` is safe because the transport code is single threaded, and since we don't `await`
+                    // after computing `exch_index` no code can remove the exchange from the session
+                    let exch = unwrap!(session.exchanges[exch_index].as_mut());
+
+                    exch.role = Role::Responder(ResponderState::Owned);
+
+                    let id = ExchangeId::new(session.id, exch_index);
+
+                    debug!("Exchange {}: Accepted", id.display(session));
+
+                    let exchange = Exchange::new(id, matter);
+
+                    Some(exchange)
+                })
+            })
+            .await;
+
+        Ok(exchange)
+    }
+
+    /// The mDNS resolve timeout used when auto-establishing a session
+    /// (CASE operational resolve, or PASE commissionable resolve).
+    /// Single-shot for now (no backoff re-query); see follow-ups.
+    const RESOLVE_TIMEOUT_MS: u32 = 5_000;
+
+    /// Open an exchange over a CASE session to an already-commissioned node.
+    ///
+    /// If a CASE session for `(fabric_idx, peer_node_id)` already exists, an
+    /// exchange is opened on it directly (the common case - session and peer
+    /// address reused, no mDNS). Otherwise the peer's operational address is
+    /// resolved over mDNS and a fresh CASE session is established (driving
+    /// [`CaseInitiator`]) before the exchange is opened on it; the peer's
+    /// MRP/session parameters advertised in the mDNS TXT records seed the
+    /// session.
+    pub(crate) async fn initiate<'a, C: Crypto>(
+        &self,
+        matter: &'a Matter<'a>,
+        crypto: C,
+        fabric_idx: NonZeroU8,
+        peer_node_id: NodeId,
+        transport: TransportPreference,
+    ) -> Result<Exchange<'a>, Error> {
+        // Reuse an existing CASE session if present.
+        let existing = matter.with_state(|state| {
+            Ok::<_, Error>(
+                state
+                    .sessions
+                    .get_for_node(fabric_idx, peer_node_id)
+                    .map(|s| s.id),
+            )
+        })?;
+
+        if let Some(session_id) = existing {
+            return self.initiate_for_session(matter, crypto, session_id);
+        }
+
+        self.initiate_new_case(matter, crypto, fabric_idx, peer_node_id, transport)
+            .await
+    }
+
+    /// Establish a fresh CASE session to an already-commissioned peer (resolving
+    /// its operational address over mDNS), then open an exchange on it. Called by
+    /// [`initiate`](Self::initiate) only when no live session to the peer exists.
+    ///
+    /// With the `case-responder-only` feature this is compiled out and replaced
+    /// by an immediate [`ErrorCode::NoSession`]: reporting (and every other
+    /// on-demand initiator) then reuses an existing session or fails, and the
+    /// linker drops the whole CASE-initiator and mDNS-resolver machinery.
+    #[cfg(not(feature = "case-responder-only"))]
+    async fn initiate_new_case<'a, C: Crypto>(
+        &self,
+        matter: &'a Matter<'a>,
+        crypto: C,
+        fabric_idx: NonZeroU8,
+        peer_node_id: NodeId,
+        transport: TransportPreference,
+    ) -> Result<Exchange<'a>, Error> {
+        // No CASE session: resolve the operational address and establish one.
+        let compressed_fabric_id = matter.with_state(|state| {
+            Ok::<_, Error>(state.fabrics.fabric(fabric_idx)?.compressed_fabric_id())
+        })?;
+
+        let service = MatterRemoteService::Operational {
+            compressed_fabric_id,
+            node_id: peer_node_id,
+        };
+
+        let resolved = self.resolve(service, Self::RESOLVE_TIMEOUT_MS).await?;
+
+        // Establish CASE over a fresh, one-shot unsecured exchange to the
+        // resolved address. On success a secure session keyed at
+        // `(fabric_idx, peer_node_id)` is recorded in the stack.
+        //
+        // The candidates are walked in score order, because the best-scored address is not
+        // necessarily the reachable one.
+        // The peer's advertised TCP support is a veto, not a trigger: a caller
+        // that asked for a large payload gets an error rather than a UDP session
+        // that silently cannot carry it.
+        if matches!(transport, TransportPreference::LargePayload) && !resolved.tcp_capable {
+            error!(
+                "Large-payload session requested for node {:?} but it does not advertise TCP server support",
+                peer_node_id
+            );
+            return Err(ErrorCode::NoNetworkInterface.into());
+        }
+
+        let mut last_err = Some(Error::from(ErrorCode::NotFound));
+
+        for addr in resolved.addrs.iter().copied() {
+            let peer = match transport {
+                TransportPreference::Mrp => Address::Udp(addr),
+                TransportPreference::LargePayload => Address::Tcp(addr),
+            };
+
+            match self.initiate_plaintext(matter, &crypto, peer).await {
+                Ok(exchange) => {
+                    match CaseInitiator::perform(exchange, &crypto, fabric_idx, peer_node_id).await
+                    {
+                        Ok(()) => {
+                            last_err = None;
+                            break;
+                        }
+                        Err(err) if err.is_peer_unresponsive() => {
+                            warn!("CASE to {} failed: {}; trying the next address", peer, err);
+                            last_err = Some(err);
+                        }
+                        Err(err) => {
+                            // The peer answered and rejected us, so it is
+                            // reachable at this address and every remaining
+                            // candidate leads to the same node. Fail now rather
+                            // than replaying the rejection against each one.
+                            warn!("CASE to {} failed: {}", peer, err);
+                            return Err(err);
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!("Unsecured session to {} failed: {}", peer, err);
+                    last_err = Some(err);
+                }
+            }
+        }
+
+        if let Some(err) = last_err {
+            return Err(err);
+        }
+
+        // Seed the new CASE session's peer MRP/session params from the resolve
+        // TXT (rs-matter does not yet exchange these in CASE Sigma1/2) and grab
+        // its id for the exchange.
+        let params = SessionParameters {
+            sii: resolved.sii,
+            sai: resolved.sai,
+            sat: resolved.sat,
+            ..Default::default()
+        };
+
+        let session_id = matter.with_state(|state| {
+            let session = state
+                .sessions
+                .get_for_node(fabric_idx, peer_node_id)
+                .ok_or(ErrorCode::NoSession)?;
+
+            session.set_peer_session_params(&params);
+
+            Ok::<_, Error>(session.id)
+        })?;
+
+        self.initiate_for_session(matter, crypto, session_id)
+    }
+
+    /// The `case-responder-only` variant: never establish a new CASE session.
+    ///
+    /// See the other [`initiate_new_case`](Self::initiate_new_case) for why this
+    /// exists. Reporting (and any other on-demand initiator) reuses an existing
+    /// session or gets [`ErrorCode::NoSession`]; nothing here references the CASE
+    /// initiator or the mDNS resolver, so the linker can drop them.
+    #[cfg(feature = "case-responder-only")]
+    async fn initiate_new_case<'a, C: Crypto>(
+        &self,
+        _matter: &'a Matter<'a>,
+        _crypto: C,
+        _fabric_idx: NonZeroU8,
+        _peer_node_id: NodeId,
+        _transport: TransportPreference,
+    ) -> Result<Exchange<'a>, Error> {
+        Err(ErrorCode::NoSession.into())
+    }
+
+    /// Resolve an already-commissioned node's operational addresses over mDNS,
+    /// returning **every** ranked candidate rather than just the best-scored one.
+    pub(crate) async fn resolve_operational_addrs(
+        &self,
+        matter: &Matter<'_>,
+        fabric_idx: NonZeroU8,
+        peer_node_id: NodeId,
+    ) -> Result<Vec<Address, MAX_RESOLVE_CANDIDATES>, Error> {
+        let compressed_fabric_id = matter.with_state(|state| {
+            Ok::<_, Error>(state.fabrics.fabric(fabric_idx)?.compressed_fabric_id())
+        })?;
+
+        let service = MatterRemoteService::Operational {
+            compressed_fabric_id,
+            node_id: peer_node_id,
+        };
+
+        let resolved = self.resolve(service, Self::RESOLVE_TIMEOUT_MS).await?;
+
+        let mut addrs = Vec::new();
+
+        for addr in resolved.addrs.iter() {
+            // Both are bounded by `MAX_RESOLVE_CANDIDATES`, so this cannot
+            // overflow.
+            let _ = addrs.push(Address::Udp(*addr));
+        }
+
+        Ok(addrs)
+    }
+
+    /// Open an exchange over a PASE session to a not-yet-commissioned node at the
+    /// given peer address.
+    ///
+    /// If a PASE session **to that peer** already exists, an exchange is opened on
+    /// it directly. Otherwise a new PASE session is established: a plaintext
+    /// session is opened and the PASE protocol ([`PaseInitiator`]) is run with
+    /// `passcode`, then an exchange is opened on the resulting PASE session.
+    ///
+    /// Reuse is keyed by peer address (not a single global PASE session), so a
+    /// commissioner can drive several concurrent commissionings.
+    ///
+    /// Discovery of the address is out of scope (mDNS via
+    /// [`Transport::browse_commissionable`], a BLE/BTP advertisement, etc.); this
+    /// method is transport-agnostic and takes the already-known address.
+    pub(crate) async fn initiate_pase<'a, C: Crypto>(
+        &self,
+        matter: &'a Matter<'a>,
+        crypto: C,
+        peer_addr: Address,
+        passcode: u32,
+    ) -> Result<Exchange<'a>, Error> {
+        // Reuse an existing PASE session to this peer, if present.
+        let existing = matter.with_state(|state| {
+            Ok::<_, Error>(state.sessions.get_pase_for_addr(&peer_addr).map(|s| s.id))
+        })?;
+
+        if let Some(session_id) = existing {
+            return self.initiate_for_session(matter, crypto, session_id);
+        }
+
+        // Establish a new PASE session to this peer.
+        let exchange = self.initiate_plaintext(matter, &crypto, peer_addr).await?;
+        PaseInitiator::perform(exchange, &crypto, passcode).await?;
+
+        let session_id = matter.with_state(|state| {
+            state
+                .sessions
+                .get_pase_for_addr(&peer_addr)
+                .map(|s| s.id)
+                .ok_or_else(|| Error::from(ErrorCode::NoSession))
+        })?;
+
+        self.initiate_for_session(matter, crypto, session_id)
+    }
+
+    pub(crate) fn initiate_for_session<'a, C: Crypto>(
+        &self,
+        matter: &'a Matter<'a>,
+        crypto: C,
+        session_id: u32,
+    ) -> Result<Exchange<'a>, Error> {
+        matter.with_state(|state| {
+            state
+                .sessions
+                .get(session_id)
+                // Expired sessions are not allowed to initiate new exchanges
+                .filter(|sess| !sess.is_expired())
+                .ok_or(ErrorCode::NoSession)?;
+
+            let exch_id = state.sessions.get_next_exch_id(crypto)?;
+
+            // `unwrap` is safe because we know we have a session or else the early return from above would've triggered
+            // The reason why we call `get_for_node` twice is to ensure that we don't waste an `exch_id` in case
+            // we don't have a session in the first place
+            let session = unwrap!(state.sessions.get(session_id));
+
+            let exch_index = session
+                .add_exch(exch_id, Role::Initiator(Default::default()))
+                .ok_or(ErrorCode::NoSpaceExchanges)?;
+
+            let id = ExchangeId::new(session.id, exch_index);
+
+            debug!("Exchange {}: Initiated", id.display(session));
+
+            Ok(Exchange::new(id, matter))
+        })
+    }
+
+    /// Create a new initiator exchange on a new plaintext session to
+    /// the given peer address, evicting an existing session and retrying once if
+    /// there is no space.
+    ///
+    /// Low-level primitive used to carry the first handshake message of PASE
+    /// ([`PaseInitiator`]) or CASE ([`CaseInitiator`]).
+    async fn initiate_plaintext<'a, C: Crypto>(
+        &self,
+        matter: &'a Matter<'a>,
+        crypto: C,
+        peer_addr: Address,
+    ) -> Result<Exchange<'a>, Error> {
+        match self.try_initiate_plaintext(matter, &crypto, peer_addr) {
+            Ok(exchange) => Ok(exchange),
+            Err(e) if e.code() == ErrorCode::NoSpaceSessions => {
+                matter
+                    .transport_runner(&crypto)
+                    .evict_some_session()
+                    .await?;
+                self.try_initiate_plaintext(matter, &crypto, peer_addr)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Create a new plaintext session and initiate an exchange on it in one step.
+    ///
+    /// This is a convenience method that combines `create_plaintext_session()` and
+    /// `initiate_for_session()`. Fails immediately if there is no space for a new session.
+    ///
+    /// For flows that need the session ID (e.g. to upgrade the session after PASE/CASE),
+    /// use `create_plaintext_session()` + `initiate_for_session()` separately.
+    fn try_initiate_plaintext<'a, C: Crypto>(
+        &self,
+        matter: &'a Matter<'a>,
+        crypto: C,
+        peer_addr: Address,
+    ) -> Result<Exchange<'a>, Error> {
+        let session_id = self.create_plaintext_session(matter, &crypto, peer_addr)?;
+
+        self.initiate_for_session(matter, crypto, session_id)
+    }
+
+    /// Create a new unsecured (plain-text) session to a given peer address.
+    ///
+    /// Returns the internal session ID that can be used with `initiate_for_session()`.
+    ///
+    /// This is the low-level building block for controller-initiated communication
+    /// (e.g. PASE/CASE initiator flows), analogous to the SDK's
+    /// `SessionManager::CreateUnauthenticatedSession()`.
+    fn create_plaintext_session<C: Crypto>(
+        &self,
+        matter: &Matter<'_>,
+        crypto: C,
+        peer_addr: Address,
+    ) -> Result<u32, Error> {
+        matter.with_state(|state| {
+            let mut rand = crypto.rand()?;
+
+            let session =
+                state
+                    .sessions
+                    .add(rand.next_u32(), false, peer_addr, None, matter.dev_det())?;
+
+            // Generate ephemeral initiator node ID per spec:
+            // "Randomly selected for each session by the initiator from the Operational Node ID range"
+            // Operational Node ID range is 0x0000_0000_0000_0001 to 0xFFFF_FFEF_FFFF_FFFF
+            // (Matter Core spec).
+            const MAX_OPERATIONAL_NODE_ID: u64 = 0xFFFF_FFEF_FFFF_FFFF;
+            let mut ephemeral_id = rand.next_u64();
+            while ephemeral_id == 0 || ephemeral_id > MAX_OPERATIONAL_NODE_ID {
+                ephemeral_id = rand.next_u64();
+            }
+            session.set_local_nodeid(ephemeral_id);
+
+            let session_id = session.id;
+
+            debug!(
+                "Unsecured session {} created for peer {}",
+                session_id, peer_addr
+            );
+
+            Ok(session_id)
+        })
+    }
+
+    pub(crate) async fn get_if_rx<F>(&self, f: F) -> PacketAccess<'_, MAX_RX_BUF_SIZE>
+    where
+        F: Fn(&Packet<MAX_RX_BUF_SIZE>) -> bool,
+    {
+        Self::get_if(&self.rx, f).await
+    }
+
+    pub(crate) async fn get_if_tx<F>(&self, f: F) -> PacketAccess<'_, MAX_TX_BUF_SIZE>
+    where
+        F: Fn(&Packet<MAX_TX_BUF_SIZE>) -> bool,
+    {
+        Self::get_if(&self.tx, f).await
+    }
+
+    async fn get_if<'b, F, const N: usize>(
+        packet_mutex: &'b IfMutex<Packet<N>>,
+        f: F,
+    ) -> PacketAccess<'b, N>
+    where
+        F: Fn(&Packet<N>) -> bool,
+    {
+        PacketAccess(packet_mutex.lock_if(f).await, false)
+    }
+
+    /// Build a `SocketAddr` from a resolved `(ip, port)`, attaching the IPv6
+    /// `scope_id` (interface zone) so a **link-local** destination (`fe80::/10`)
+    /// is routable.
+    ///
+    /// The scope is only meaningful — and only applied — for link-local IPv6;
+    /// for any other address it is irrelevant and `SocketAddr::new` is used
+    /// as-is.
+    fn scoped_socket_addr(ip: IpAddr, port: u16, scope_id: u32) -> SocketAddr {
+        match ip {
+            IpAddr::V6(v6) if v6.is_unicast_link_local() => {
+                SocketAddr::V6(SocketAddrV6::new(v6, port, 0, scope_id))
+            }
+            _ => SocketAddr::new(ip, port),
+        }
+    }
+}
+
+/// Which transport a freshly established operational session should run over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum TransportPreference {
+    /// UDP carrying MRP - the default operational transport, and the only one
+    /// every Matter node is required to support.
+    #[default]
+    Mrp,
+    /// TCP, for payloads too large to fit MRP.
+    ///
+    /// Requires the peer to have advertised TCP server support
+    /// ([`ResolvedNode::tcp_capable`]). If it has not, establishment fails with
+    /// [`ErrorCode::NoNetworkInterface`] rather than quietly falling back to UDP -
+    /// a silent downgrade would hand the caller a session that cannot carry what
+    /// it asked to send.
+    LargePayload,
+}
+
+/// Resets the mDNS resolve rendezvous to `Idle` on drop, unless disarmed.
+///
+/// This guarantees that a dropped (cancelled or timed-out) [`Transport::resolve`]
+/// future does not leave the single-slot rendezvous occupied for other callers.
+struct MdnsResolveGuard<'a> {
+    signal: &'a Signal<MdnsResolveState>,
+    armed: bool,
+}
+
+impl Drop for MdnsResolveGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.signal.modify(|state| {
+                if matches!(state, MdnsResolveState::Idle) {
+                    (false, ())
+                } else {
+                    *state = MdnsResolveState::Idle;
+                    (true, ())
+                }
+            });
+        }
+    }
+}
+
+/// Resets the mDNS browse rendezvous to `Idle` on drop, unless disarmed (the
+/// browse analog of [`ResolveGuard`]).
+struct MdnsBrowseGuard<'a> {
+    signal: &'a Signal<MdnsBrowseState>,
+    armed: bool,
+}
+
+impl Drop for MdnsBrowseGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.signal.modify(|state| {
+                if matches!(state, MdnsBrowseState::Idle) {
+                    (false, ())
+                } else {
+                    *state = MdnsBrowseState::Idle;
+                    (true, ())
+                }
+            });
+        }
+    }
+}
+
+/// The Matter Transport Runner, responsible for running the network transport by processing incoming and ougoing packets
+/// and thus also managing sessions and exchanges.
+///
+/// The transport runner is wrapping the whole Matter Object, because it needs access to various states, like
+/// sessions, fabrics and the transport buffers / state itself.
+pub struct TransportRunner<'a, C> {
+    matter: &'a Matter<'a>,
+    crypto: C,
+}
+
+impl<'a, C: Crypto> TransportRunner<'a, C> {
+    /// Create a new `TransportRunner` instance with the given `Matter` instance and `Crypto` implementation.
+    pub const fn new(matter: &'a Matter<'a>, crypto: C) -> Self {
+        Self { matter, crypto }
+    }
+
+    /// Run the transport runner with the given network send, receive and multicast implementations.
+    ///
+    /// The `multicast` implementation is only used to manage group (multicast)
+    /// membership, so without the `groups` feature it is accepted but never used.
+    pub async fn run<S, R, M>(
+        &mut self,
+        send: S,
+        recv: R,
+        #[cfg_attr(not(feature = "groups"), allow(unused_variables))] multicast: M,
+    ) -> Result<(), Error>
+    where
+        S: NetworkSend,
+        R: NetworkReceive,
+        M: NetworkMulticast,
+    {
+        info!("Running Matter transport");
+
+        // Do not remove this logging line or change its formatting.
+        // C++ E2E tests rely on this log line to determine when the tested app is ready.
+        info!("APP STATUS: Starting event loop");
+
+        // Do not remove this logging line or change its formatting either.
+        //
+        // `waitForApplicationUp` in the harness
+        // (`scripts/tests/chiptest/test_definition.py`) blocks until it has seen
+        // *both* "APP STATUS: Starting event loop" and "mDNS service published:"
+        // on the app's stdout, so the phrase has to appear at least once per
+        // start.
+        info!("mDNS service published: (app started)");
+
+        let send = IfMutex::new(send);
+
+        let mut rx = pin!(self.process_rx(recv, &send));
+        let mut tx = pin!(self.process_tx(&send));
+        let mut orphaned = pin!(self.process_orphaned());
+
+        #[cfg(feature = "groups")]
+        {
+            let mut joined = self.transport().group_addrs.lock().await;
+            let mut groups = pin!(self.process_groups(multicast, &mut joined));
+
+            select4(&mut rx, &mut tx, &mut orphaned, &mut groups)
+                .coalesce()
+                .await
+        }
+
+        #[cfg(not(feature = "groups"))]
+        {
+            select3(&mut rx, &mut tx, &mut orphaned).coalesce().await
+        }
+    }
+
+    /// Record a `GroupcastTesting` observation for a multicast group data
+    /// message that failed decode/decryption, when the Groupcast listener
+    /// testing mode is armed. See the Matter Core spec's `GroupcastTesting`
+    /// command for the result classification.
+    #[cfg(feature = "groups")]
+    fn observe_group_rx_failure<const N: usize>(
+        &self,
+        packet: &Packet<N>,
+        fabrics: &crate::fabric::Fabrics,
+        e: &Error,
+    ) {
+        use crate::dm::clusters::groupcast;
+
+        // Only multicast group *data* messages participate (not unicast
+        // group-encrypted MCSP control messages)
+        let Some(group_id) = packet.header.plain.get_dst_groupcast_nodeid() else {
+            return;
+        };
+
+        let Some(mode) = self
+            .matter
+            .groupcast_testing()
+            .armed(groupcast::GroupcastTestingEnum::EnableListenerTesting)
+        else {
+            return;
+        };
+
+        let (result, authenticated) = match e.code() {
+            // No candidate key was available to even attempt decryption
+            ErrorCode::NoSession => (groupcast::GroupcastTestResultEnum::NoAvailableKey, false),
+            // Candidate key(s) were tried, none authenticated the message
+            ErrorCode::InvalidSignature => (groupcast::GroupcastTestResultEnum::FailedAuth, false),
+            // Authenticated, but a duplicate of an already-received message
+            ErrorCode::Duplicate => (groupcast::GroupcastTestResultEnum::MessageReplay, true),
+            _ => (groupcast::GroupcastTestResultEnum::GeneralError, false),
+        };
+
+        self.matter
+            .groupcast_testing()
+            .observe(groupcast::TestingObservation {
+                src_ip: groupcast::TestingObservation::addr_ip(&packet.peer),
+                dst_ip: Some(groupcast::TestingObservation::group_dst_ip(
+                    fabrics,
+                    mode.fab_idx,
+                    group_id,
+                )),
+                // Per the Matter Core spec, the `GroupID` field is filled
+                // from the request only when the message was properly
+                // authenticated for the fabric under test
+                group_id: authenticated.then_some(group_id),
+                endpoint_id: None,
+                cluster_id: None,
+                element_id: None,
+                access_allowed: None,
+                result,
+            });
+    }
+
+    #[cfg(feature = "groups")]
+    async fn process_groups<M>(
+        &self,
+        mut multicast: M,
+        joined: &mut Vec<Ipv6Addr, MAX_GROUP_ADDRS>,
+    ) -> Result<(), Error>
+    where
+        M: NetworkMulticast,
+    {
+        joined.clear();
+
+        loop {
+            let addr_op = self.matter.with_state(|state| {
+                let group_addrs = || {
+                    state.fabrics.iter().flat_map(|fabric| {
+                        fabric.groups().iter().map(|group| {
+                            // Groups with the `IanaAddr` Groupcast policy all
+                            // share the IANA-assigned address; `PerGroup` ones
+                            // (and legacy Groups-cluster entries, which behave
+                            // as `PerGroup`) each use a fabric+group-scoped
+                            // address. Duplicate enumeration of the shared
+                            // address is fine - the join/leave reconciliation
+                            // below is idempotent per address.
+                            use crate::dm::clusters::decl::groupcast::MulticastAddrPolicyEnum;
+
+                            match group.effective_mcast_policy() {
+                                MulticastAddrPolicyEnum::IanaAddr => {
+                                    crate::utils::ipv6::IANA_GROUPCAST_MULTICAST_ADDR
+                                }
+                                MulticastAddrPolicyEnum::PerGroup => {
+                                    compute_group_multicast_addr(fabric.fabric_id(), group.group_id)
+                                }
+                            }
+                        })
+                    })
+                };
+
+                if let Some(new_addr) = group_addrs().find(|addr| !joined.contains(addr)) {
+                    Some((new_addr, true))
+                } else {
+                    joined
+                        .iter()
+                        .find(|addr| !group_addrs().any(|a| a == **addr))
+                        .map(|&removed_addr| (removed_addr, false))
+                }
+            });
+
+            match addr_op {
+                Some((new_addr, true)) => {
+                    match multicast.join(new_addr.into()).await {
+                        Ok(_) => {
+                            debug!("Joined multicast group: {}", new_addr);
+                            // `joined` should be able to contain theoretical maximum number of multicast address
+                            // So this unwrap should be safe
+                            unwrap!(joined.push(new_addr));
+                        }
+                        Err(e) => error!(
+                            "Joining multicast group {} failed with error: {}",
+                            new_addr, e
+                        ),
+                    }
+                }
+                Some((removed_addr, false)) => match multicast.leave(removed_addr.into()).await {
+                    Ok(_) => {
+                        debug!("Left multicast group: {}", removed_addr);
+                        let index = joined
+                            .iter()
+                            .position(|&addr| addr == removed_addr)
+                            .unwrap();
+                        joined.swap_remove(index);
+                    }
+                    Err(e) => error!(
+                        "Leaving multicast group {} failed with error: {}",
+                        removed_addr, e
+                    ),
+                },
+                None => {
+                    self.transport().wait_groups_changed().await;
+                }
+            }
+        }
+    }
+
+    async fn process_tx<S>(&self, send: &IfMutex<S>) -> Result<(), Error>
+    where
+        S: NetworkSend,
+    {
+        loop {
+            trace!("Waiting for outgoing packet");
+
+            let mut tx = self
+                .matter
+                .transport
+                .get_if_tx(|packet| !packet.buf.is_empty())
+                .await;
+            tx.clear_on_drop(true);
+
+            if let TxPayloadState::NotEncoded { session_id } = tx.tx_info.payload_state {
+                let encoded = self.matter.with_state(|state| {
+                    if let Some(session) = state.sessions.get_for_tx(session_id) {
+                        self.encode_packet(&mut tx, Some(session))?;
+
+                        Ok::<_, Error>(true)
+                    } else {
+                        error!(
+                            "TX packet has session ID {}, but no such session exists, dropping",
+                            session_id
+                        );
+
+                        Ok(false)
+                    }
+                })?;
+
+                if !encoded {
+                    continue;
+                }
+            }
+
+            Self::netw_send(send, tx.peer, &tx.buf[tx.payload_start..], false).await?;
+
+            if !tx.tx_info.retransmission {
+                self.transport()
+                    .counters
+                    .lock(|counters| counters.borrow_mut().record_sent(&tx.header.proto));
+            }
+        }
+    }
+
+    async fn process_rx<R, S>(&self, mut recv: R, send: &IfMutex<S>) -> Result<(), Error>
+    where
+        R: NetworkReceive,
+        S: NetworkSend,
+    {
+        loop {
+            trace!("Waiting for incoming packet");
+
+            recv.wait_available().await?;
+
+            let mut rx = self
+                .matter
+                .transport
+                .get_if_rx(|packet| packet.buf.is_empty())
+                .await;
+            rx.clear_on_drop(true); // In case of error, or if the future is dropped
+
+            // TODO: Resizing might be a bit expensive with large buffers
+            // Resizing to `MAX_RX_BUF_SIZE` is always safe because the size of the `buf` heapless vec `MAX_RX_BUF_SIZE`
+            unwrap!(rx.buf.resize_default(MAX_RX_BUF_SIZE));
+
+            let (len, peer) = Self::netw_recv(&mut recv, &mut rx.buf).await?;
+
+            rx.peer = peer;
+            rx.buf.truncate(len);
+            rx.payload_start = 0;
+
+            match self.handle_rx_packet(&mut rx, send).await {
+                Ok(true) => {
+                    // Leave the packet in place for accepting by responders
+                    rx.clear_on_drop(false);
+                }
+                Ok(false) => {
+                    // Drop the packet, as no further processing is necessary
+                }
+                Err(e) => {
+                    // Drop the packet and report the unexpected error
+                    error!("UNEXPECTED RX ERROR: {:?}", e);
+                }
+            }
+        }
+    }
+
+    async fn process_orphaned(&self) -> Result<(), Error> {
+        let mut rx_accept_timeout = pin!(self.process_accept_timeout_rx());
+        let mut rx_orphaned = pin!(self.process_orphaned_rx());
+        let mut exch_dropped = pin!(self.process_dropped_exchanges());
+
+        select3(&mut rx_accept_timeout, &mut rx_orphaned, &mut exch_dropped)
+            .coalesce()
+            .await
+    }
+
+    async fn process_accept_timeout_rx(&self) -> Result<(), Error> {
+        loop {
+            trace!("Waiting for accept timeout");
+
+            let mut accept_timeout = pin!(self
+                .matter
+                .transport
+                .rx
+                .with(|packet| { self.handle_accept_timeout_rx_packet(packet).then_some(()) }));
+
+            let mut timer = pin!(Timer::after(embassy_time::Duration::from_millis(50)));
+
+            select(&mut accept_timeout, &mut timer).await;
+        }
+    }
+
+    async fn process_orphaned_rx(&self) -> Result<(), Error> {
+        loop {
+            trace!("Waiting for orphaned RX packets");
+
+            self.transport()
+                .rx
+                .with(|packet| self.handle_orphaned_rx_packet(packet).then_some(()))
+                .await;
+        }
+    }
+
+    async fn process_dropped_exchanges(&self) -> Result<(), Error> {
+        loop {
+            trace!("Waiting for dropped exchanges");
+
+            let mut tx = self
+                .matter
+                .transport
+                .get_if_tx(|packet| packet.buf.is_empty())
+                .await;
+            tx.clear_on_drop(true); // In case of error, or if the future is dropped
+
+            let wait = match self.handle_dropped_exchange(&mut tx) {
+                Ok(wait) => {
+                    tx.clear_on_drop(false);
+                    wait
+                }
+                Err(e) => {
+                    error!("UNEXPECTED RX ERROR: {:?}", e);
+                    false
+                }
+            };
+
+            drop(tx);
+
+            if wait {
+                let mut timeout = pin!(Timer::after(embassy_time::Duration::from_millis(100)));
+                let mut wait = pin!(self.transport().exchange_dropped.wait());
+
+                select(&mut timeout, &mut wait).await;
+            }
+        }
+    }
+
+    async fn handle_rx_packet<const N: usize, S>(
+        &self,
+        packet: &mut Packet<N>,
+        send: &IfMutex<S>,
+    ) -> Result<bool, Error>
+    where
+        S: NetworkSend,
+    {
+        let result = self.decode_packet_with_eviction(packet).await;
+        match result {
+            Err(e) if matches!(e.code(), ErrorCode::Duplicate) => {
+                if packet.header.plain.is_group_session() {
+                    // Group messages are multicast and don't use MRP; silently discard duplicates
+                    mrp_log!(
+                        "\n>>RCV {}\n      => Duplicate group message, discarding",
+                        packet
+                    );
+                } else if !packet.peer.is_reliable()
+                    && !MessageMeta::from(&packet.header.proto).is_standalone_ack()
+                {
+                    mrp_log!("\n>>RCV {}\n      => Duplicate, sending ACK", packet);
+
+                    self.matter.with_state(|state| {
+                        // `unwrap` is safe because we know we have a session.
+                        // If we didn't have a session, the error code would've been `NoSession`
+                        //
+                        // Also, since the transport code is single threaded, and since we don't `await`
+                        // after decoding the packet, no code can the session
+                        let session = unwrap!(state
+                            .sessions
+                            .get_for_rx(&packet.peer, &packet.header.plain));
+
+                        let ack = packet.header.plain.ctr;
+
+                        packet.header.proto.toggle_initiator();
+                        packet.header.proto.set_ack(Some(ack));
+
+                        self.write_packet(packet, Some(session), None, true, |_| {
+                            Ok(Some(OpCode::MRPStandAloneAck.into()))
+                        })
+                    })?;
+
+                    Self::netw_send(send, packet.peer, &packet.buf[packet.payload_start..], true)
+                        .await?;
+                } else {
+                    mrp_log!("\n>>RCV {}\n      => Duplicate, discarding", packet);
+                }
+            }
+            Err(e) if matches!(e.code(), ErrorCode::NoSpaceSessions) => {
+                if !packet.header.plain.is_encrypted()
+                    && MessageMeta::from(&packet.header.proto).is_new_session()
+                {
+                    warn!(
+                        "\n>>RCV {}\n      => No space for a new unencrypted session, sending Busy",
+                        packet
+                    );
+
+                    let ack = packet.header.plain.ctr;
+
+                    packet.header.proto.toggle_initiator();
+                    packet.header.proto.set_ack(Some(ack));
+
+                    self.write_packet(packet, None, None, true, |wb| {
+                        sc_write(wb, SCStatusCodes::Busy, &[0xF4, 0x01])
+                    })?;
+
+                    Self::netw_send(send, packet.peer, &packet.buf[packet.payload_start..], true)
+                        .await?;
+                } else {
+                    error!(
+                        "\n>>RCV {}\n      => No space for a new encrypted session, dropping",
+                        packet
+                    );
+                }
+            }
+            Err(e) if matches!(e.code(), ErrorCode::NoSpaceExchanges) => {
+                // TODO: Before closing the session, try to take other measures:
+                // - For CASESigma1 & PBKDFParamRequest - send Busy instead
+                // - For Interaction Model interactions that do need an ACK - send IM Busy,
+                //   wait for ACK and retransmit without releasing the RX buffer, potentially
+                //   blocking all other interactions
+
+                error!(
+                    "\n>>RCV {}\n      => No space for a new exchange, closing session",
+                    packet
+                );
+
+                self.matter.with_state(|state| {
+                    // `unwrap` is safe because we know we have a session.
+                    // If we didn't have a session, the error code would've been `NoSession`
+                    //
+                    // Also, since the transport code is single threaded, and since we don't `await`
+                    // after decoding the packet, no code can the session
+                    let session_id = unwrap!(state
+                        .sessions
+                        .get_for_rx(&packet.peer, &packet.header.plain))
+                    .id;
+
+                    packet.header.proto.exch_id = state.sessions.get_next_exch_id(&self.crypto)?;
+                    packet.header.proto.set_initiator();
+
+                    // See above why `unwrap` is safe
+                    let mut session = unwrap!(state.sessions.remove(session_id));
+                    self.transport().notify_session_removed();
+
+                    self.write_packet(packet, Some(&mut session), None, true, |wb| {
+                        sc_write(wb, SCStatusCodes::CloseSession, &[])
+                    })
+                })?;
+
+                Self::netw_send(send, packet.peer, &packet.buf[packet.payload_start..], true)
+                    .await?;
+            }
+            Err(e) if matches!(e.code(), ErrorCode::NoExchange) => {
+                mrp_log!(
+                    "\n>>RCV {}\n      => No valid exchange found, dropping",
+                    packet
+                );
+            }
+            Err(e) if matches!(e.code(), ErrorCode::NoSession) => {
+                // Per Matter Core spec, when a session-bearing
+                // message arrives for which we have no matching secure session
+                // (e.g. after a reboot has wiped the session table while the
+                // peer still believes the old session is alive), we reply with
+                // an unsecured `SessionNotFound` Status Report on the Secure
+                // Channel protocol. This nudges the peer to drop its stale
+                // session and re-establish CASE, instead of waiting for MRP
+                // retries to exhaust on its side.
+                warn!(
+                    "\n>>RCV {}\n      => No valid session found, replying with SessionNotFound",
+                    packet
+                );
+
+                // `write_packet` with `session = None` requires the incoming
+                // header to look like an unsecured, non-reliable, source-tagged
+                // packet (see its preconditions). Clear `sess_id` so it is not
+                // considered encrypted, drop the reliable/ack flags since we
+                // are not party to any exchange, and stamp a placeholder
+                // `src_nodeid` (echoed as the response's `dst_nodeid` — UDP
+                // peer addressing is what actually routes the reply).
+                packet.header.plain.sess_id = 0;
+                packet.header.plain.set_src_nodeid(Some(0));
+                packet.header.proto.unset_reliable();
+                packet.header.proto.set_ack(None);
+
+                self.write_packet(packet, None, None, true, |wb| {
+                    sc_write(wb, SCStatusCodes::SessionNotFound, &[])
+                })?;
+
+                Self::netw_send(send, packet.peer, &packet.buf[packet.payload_start..], true)
+                    .await?;
+            }
+            Err(e) => {
+                error!("\n>>RCV {}\n      => Error ({:?}), dropping", packet, e);
+            }
+            Ok(new_exchange) => {
+                let meta = MessageMeta::from(&packet.header.proto);
+
+                if meta.is_standalone_ack() {
+                    // No need to propagate this further
+                    debug!("\n>>RCV {}\n      => Standalone Ack, dropping", packet);
+                } else if meta.is_sc_status()
+                    && matches!(
+                        Self::is_close_session(&mut packet.buf[packet.payload_start..]),
+                        Ok(true)
+                    )
+                {
+                    warn!(
+                        "\n>>RCV {}\n      => Close session received, removing this session",
+                        packet
+                    );
+
+                    self.matter.with_state(|state| {
+                        if let Some(session_id) = state
+                            .sessions
+                            .get_for_rx(&packet.peer, &packet.header.plain)
+                            .map(|sess| sess.id)
+                        {
+                            state.sessions.remove(session_id);
+                            self.transport().notify_session_removed();
+                        }
+                    });
+                } else {
+                    self.transport()
+                        .counters
+                        .lock(|counters| counters.borrow_mut().record_recv(&packet.header.proto));
+
+                    debug!(
+                        "\n>>RCV {}\n      => Processing{}",
+                        packet,
+                        if new_exchange { " (new exchange)" } else { "" }
+                    );
+
+                    #[cfg(feature = "log-tlv-payload")]
+                    debug!(
+                        "{}",
+                        Packet::<0>::display_payload(
+                            &packet.header.proto,
+                            &packet.buf[core::cmp::min(packet.payload_start, packet.buf.len())..]
+                        )
+                    );
+
+                    #[cfg(not(feature = "log-tlv-payload"))]
+                    trace!(
+                        "{}",
+                        Packet::<0>::display_payload(
+                            &packet.header.proto,
+                            &packet.buf[core::cmp::min(packet.payload_start, packet.buf.len())..]
+                        )
+                    );
+
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn handle_accept_timeout_rx_packet<const N: usize>(&self, packet: &mut Packet<N>) -> bool {
+        if packet.buf.is_empty() {
+            return false;
+        }
+
+        self.matter.with_state(|state| {
+            let Some(session) = state
+                .sessions
+                .get_for_rx(&packet.peer, &packet.header.plain)
+            else {
+                return false;
+            };
+
+            let Some(exch_index) = session.get_exch_for_rx(&packet.header.proto) else {
+                return false;
+            };
+
+            // `unwrap` is safe because we know we have a session and an exchange, or else the early returns from above would've triggered
+            let exchange = unwrap!(session.exchanges[exch_index].as_mut());
+
+            if !matches!(
+                exchange.role,
+                Role::Responder(ResponderState::AcceptPending)
+            ) || !exchange.mrp.has_rx_timed_out(ACCEPT_TIMEOUT_MS)
+            {
+                return false;
+            }
+
+            mrp_log!(
+                "\n>>RCV {}\n => Accept timeout, marking exchange as dropped",
+                packet
+            );
+
+            exchange.role = Role::Responder(ResponderState::Dropped);
+            packet.buf.clear();
+            self.transport().exchange_dropped.notify();
+
+            true
+        })
+    }
+
+    fn handle_orphaned_rx_packet<const N: usize>(&self, packet: &mut Packet<N>) -> bool {
+        if packet.buf.is_empty() {
+            return false;
+        }
+
+        self.matter.with_state(|state| {
+            let Some(session) = state
+                .sessions
+                .get_for_rx(&packet.peer, &packet.header.plain)
+            else {
+                mrp_log!("\n>>RCV {}\n => No session, dropping", packet);
+
+                packet.buf.clear();
+                return true;
+            };
+
+            let Some(exch_index) = session.get_exch_for_rx(&packet.header.proto) else {
+                mrp_log!("\n>>RCV {}\n => No exchange, dropping", packet);
+
+                packet.buf.clear();
+                return true;
+            };
+
+            // `unwrap` is safe because we know we have a session and an exchange, or else the early returns from above would've triggered
+            let exchange = unwrap!(session.exchanges[exch_index].as_mut());
+
+            if exchange.role.is_dropped_state() {
+                mrp_log!(
+                    "\n>>RCV {}\n => Owned by orphaned dropped {}, dropping packet",
+                    packet,
+                    ExchangeId::new(session.id, exch_index)
+                );
+
+                packet.buf.clear();
+                return true;
+            }
+
+            false
+        })
+    }
+
+    fn handle_dropped_exchange<const N: usize>(
+        &self,
+        packet: &mut Packet<N>,
+    ) -> Result<bool, Error> {
+        self.matter.with_state(|state| {
+            let exch = state
+                .sessions
+                .get_exch(|_, exch| exch.role.is_dropped_state() && exch.mrp.is_retrans_pending())
+                .map(|(sess, exch_index)| (sess.id, exch_index, true))
+                .or_else(|| {
+                    state
+                        .sessions
+                        .get_exch(|_, exch| {
+                            exch.role.is_dropped_state() && !exch.mrp.is_retrans_pending()
+                        })
+                        .map(|(sess, exch_index)| (sess.id, exch_index, false))
+                });
+
+            let Some((session_id, exch_index, close_session)) = exch else {
+                return Ok(exch.is_none());
+            };
+
+            let exchange_id = ExchangeId::new(session_id, exch_index);
+
+            if close_session {
+                // Found a dropped exchange which has an incomplete (re)transmission
+                // Close the whole session
+
+                error!(
+                    "Dropped exchange {}: Closing session because the exchange cannot be closed cleanly",
+                    exchange_id.display(unwrap!(state.sessions.get(session_id))) // Session exists or else we wouldn't be here
+                );
+
+                self.write_evict_session_packet(packet, &mut state.sessions, session_id, false)?;
+            } else {
+                // Found a dropped exchange which has no outstanding (re)transmission
+                // Send a standalone ACK if necessary and then close it
+
+                // `unwrap` is safe because we know we have a session and an exchange, or else the early returns from above would've triggered
+                let session = unwrap!(state.sessions.get(session_id));
+                // Ditto
+                let exchange = unwrap!(session.exchanges[exch_index].as_mut());
+
+                if exchange.mrp.is_ack_pending() {
+                    self.write_packet(
+                        packet,
+                        Some(session),
+                        Some(exch_index),
+                        false,
+                        |_| Ok(Some(OpCode::MRPStandAloneAck.into())),
+                    )?;
+                }
+
+                warn!("Dropped exchange {}: Closed", exchange_id.display(session));
+                session.exchanges[exch_index] = None;
+            }
+
+            Ok(exch.is_none())
+        })
+    }
+
+    pub(crate) async fn evict_some_session(&self) -> Result<(), Error> {
+        let mut tx = self
+            .matter
+            .transport
+            .get_if_tx(|packet| packet.buf.is_empty())
+            .await;
+        tx.clear_on_drop(true); // By default, if an error occurs
+
+        let evicted = self.write_evict_some_session_packet(&mut tx, true)?;
+
+        if evicted {
+            // Send it
+            tx.clear_on_drop(false);
+
+            Ok(())
+        } else {
+            Err(ErrorCode::NoSpaceSessions.into())
+        }
+    }
+
+    async fn decode_packet_with_eviction<const N: usize>(
+        &self,
+        packet: &mut Packet<N>,
+    ) -> Result<bool, Error> {
+        let payload_start = packet.payload_start;
+        match self.decode_packet(packet) {
+            Err(err)
+                if matches!(err.code(), ErrorCode::NoSpaceSessions)
+                    && !packet.header.plain.is_encrypted()
+                    && MessageMeta::from(&packet.header.proto).is_new_session() =>
+            {
+                // Queue CloseSession in TX, preserving the original plaintext RX bytes.
+                // The existing eviction policy excludes reserved sessions and active exchanges.
+                self.evict_some_session().await?;
+                packet.payload_start = payload_start;
+                self.decode_packet(packet)
+            }
+            result => result,
+        }
+    }
+
+    fn decode_packet<const N: usize>(&self, packet: &mut Packet<N>) -> Result<bool, Error> {
+        self.matter.with_state(|state| {
+            packet.header.reset();
+
+            let mut pb = ParseBuf::new(&mut packet.buf[packet.payload_start..]);
+            packet.header.plain.decode(&mut pb)?;
+
+            let set_payload = |packet: &mut Packet<N>, (start, end)| {
+                packet.payload_start = start;
+                packet.buf.truncate(end);
+            };
+
+            if let Some(session) = state
+                .sessions
+                .get_for_rx(&packet.peer, &packet.header.plain)
+            {
+                // Found existing session: decode, indicate packet payload slice and process further
+
+                let payload_range =
+                    session.decode_remaining(&self.crypto, &mut packet.header, pb)?;
+                set_payload(packet, payload_range);
+
+                return session.post_recv(&packet.header);
+            }
+
+            // No existing session: we either have to create one, or return an error
+
+            if !packet.header.plain.is_encrypted() {
+                // Unencrypted packets can be decoded without a session, and we need to anyway do that
+                // in order to determine (based on proto hdr data) whether to create a new session or not
+                packet
+                    .header
+                    .decode_remaining(&self.crypto, None, 0, &mut pb)?;
+                packet.header.proto.adjust_reliability(true, &packet.peer);
+
+                let payload_range = pb.slice_range();
+                set_payload(packet, payload_range);
+
+                if MessageMeta::from(&packet.header.proto).is_new_session() {
+                    // As per spec, new unencrypted sessions are only created for
+                    // `PBKDFParamRequest` or `CASESigma1` unencrypted messages
+
+                    let mut rand = self.crypto.rand()?;
+
+                    let session = state.sessions.add(
+                        rand.next_u32(),
+                        false,
+                        packet.peer,
+                        packet.header.plain.get_src_nodeid(),
+                        self.matter.dev_det(),
+                    )?;
+
+                    // Session created successfully: decode, indicate packet payload slice and process further
+                    return session.post_recv(&packet.header);
+                }
+            } else {
+                #[cfg(feature = "groups")]
+                if packet.header.plain.is_group_session() {
+                    // Group (multicast) message — derive keys on-the-fly and decrypt
+                    let result = state.sessions.get_or_create_for_group_rx(
+                        &self.crypto,
+                        &state.fabrics,
+                        packet,
+                        self.matter.dev_det(),
+                    );
+
+                    let (session, payload_range) = match result {
+                        Ok(ok) => ok,
+                        Err(e) => {
+                            // When the Groupcast listener testing mode is
+                            // armed, report failed multicast group messages
+                            // as `GroupcastTesting` observations (turned
+                            // into events by the Groupcast handler)
+                            self.observe_group_rx_failure(packet, &state.fabrics, &e);
+
+                            return Err(e);
+                        }
+                    };
+
+                    set_payload(packet, payload_range);
+
+                    return session.post_recv(&packet.header);
+                }
+
+                // Encrypted unicast packet with no matching session — cannot be decoded
+                set_payload(packet, (0, 0));
+            }
+
+            Err(ErrorCode::NoSession.into())
+        })
+    }
+
+    fn encode_packet<const N: usize>(
+        &self,
+        packet: &mut Packet<N>,
+        session: Option<&mut Session>,
+    ) -> Result<(), Error> {
+        assert!(matches!(
+            packet.tx_info.payload_state,
+            TxPayloadState::NotEncoded { .. }
+        ));
+
+        let payload_end = packet.buf.len();
+
+        if packet.tx_info.retransmission {
+            mrp_log!(
+                "\n<<SND {}\n      => Re-sending",
+                Packet::<0>::display(&packet.peer, &packet.header),
+            );
+        } else {
+            debug!(
+                "\n<<SND {}\n      => Sending",
+                Packet::<0>::display(&packet.peer, &packet.header),
+            );
+        }
+
+        #[cfg(feature = "log-tlv-payload")]
+        debug!(
+            "{}",
+            Packet::<0>::display_payload(
+                &packet.header.proto,
+                &packet.buf[packet.payload_start..payload_end]
+            )
+        );
+
+        #[cfg(not(feature = "log-tlv-payload"))]
+        trace!(
+            "{}",
+            Packet::<0>::display_payload(
+                &packet.header.proto,
+                &packet.buf[packet.payload_start..payload_end]
+            )
+        );
+
+        unwrap!(packet.buf.resize_default(N));
+
+        let mut wb = WriteBuf::new_with(&mut packet.buf, packet.payload_start, payload_end);
+        if let Some(session) = session {
+            session.encode(&self.crypto, &packet.header, &mut wb)?;
+        } else {
+            packet.header.encode(&self.crypto, None, 0, &mut wb)?;
+        }
+
+        let encoded_payload_start = wb.get_start();
+        let encoded_payload_end = wb.get_tail();
+
+        packet.payload_start = encoded_payload_start;
+        packet.tx_info.payload_state = TxPayloadState::Encoded;
+        packet.buf.truncate(encoded_payload_end);
+
+        Ok(())
+    }
+
+    fn write_packet<const N: usize, F>(
+        &self,
+        packet: &mut Packet<N>,
+        mut session: Option<&mut Session>,
+        exchange_index: Option<usize>,
+        encode: bool,
+        payload_writer: F,
+    ) -> Result<(), Error>
+    where
+        F: FnOnce(&mut WriteBuf) -> Result<Option<MessageMeta>, Error>,
+    {
+        // TODO: Resizing might be a bit expensive with large buffers
+        // Resizing to `N` is always safe because it is a responsibility of the caller to ensure that N is <= `MAX_RX_BUF_SIZE`,
+        // which is the size of `buf` heapless vec
+        unwrap!(packet.buf.resize_default(N));
+
+        let mut wb = WriteBuf::new_with(
+            &mut packet.buf,
+            PacketHdr::HDR_RESERVE,
+            PacketHdr::HDR_RESERVE,
+        );
+
+        let Some(meta) = payload_writer(&mut wb)? else {
+            packet.buf.clear();
+            return Ok(());
+        };
+
+        let (start, end) = (wb.get_start(), wb.get_tail());
+
+        packet.payload_start = start;
+        packet.buf.truncate(end);
+
+        meta.set_into(&mut packet.header.proto);
+
+        if let Some(session) = &mut session {
+            packet.header.plain = Default::default();
+
+            let (peer, retransmission) = session.pre_send(
+                exchange_index,
+                &mut packet.header,
+                self.transport().device_sai,
+                self.transport().device_sii,
+            )?;
+
+            packet.peer = peer;
+            packet.tx_info.retransmission = retransmission;
+            packet.tx_info.payload_state = TxPayloadState::NotEncoded {
+                session_id: session.id,
+            };
+        } else {
+            if packet.header.plain.is_encrypted()
+                || packet.header.plain.get_src_nodeid().is_none()
+                || packet.header.proto.is_reliable()
+            {
+                // We can encode packets without a session only when they are unencrypted and do not need a retransmission
+                Err(ErrorCode::NoSession)?;
+            }
+
+            let src_nodeid = packet.header.plain.get_src_nodeid();
+
+            packet.header.plain = Default::default();
+
+            packet.header.plain.sess_id = 0;
+            packet.header.plain.ctr = 1;
+            packet.header.plain.set_src_nodeid(None);
+            packet.header.plain.set_dst_unicast_nodeid(src_nodeid);
+
+            packet.header.proto.unset_initiator();
+            packet.header.proto.adjust_reliability(false, &packet.peer);
+
+            packet.tx_info.retransmission = false;
+            packet.tx_info.payload_state = TxPayloadState::NotEncoded { session_id: 0 };
+        }
+
+        if encode {
+            self.encode_packet(packet, session)?;
+        }
+
+        Ok(())
+    }
+
+    fn write_evict_some_session_packet<const N: usize>(
+        &self,
+        packet: &mut Packet<N>,
+        encode: bool,
+    ) -> Result<bool, Error> {
+        self.matter.with_state(|state| {
+            let id = state
+                .sessions
+                .get_session_for_eviction()
+                .map(|sess| sess.id);
+            if let Some(id) = id {
+                self.write_evict_session_packet(packet, &mut state.sessions, id, encode)?;
+
+                Ok(true)
+            } else {
+                error!("All sessions have active exchanges, cannot evict any session");
+
+                Ok(false)
+            }
+        })
+    }
+
+    fn write_evict_session_packet<const N: usize>(
+        &self,
+        packet: &mut Packet<N>,
+        sessions: &mut Sessions,
+        id: u32,
+        encode: bool,
+    ) -> Result<(), Error> {
+        packet.header.proto.exch_id = sessions.get_next_exch_id(&self.crypto)?;
+        packet.header.proto.set_initiator();
+
+        // It is a responsibility of the caller to ensure that this method is called with a valid session ID
+        let mut session = unwrap!(sessions.remove(id));
+        self.transport().notify_session_removed();
+
+        debug!(
+            "Evicting session {} [SID:{:x},RSID:{:x}]",
+            session.id,
+            session.get_local_sess_id(),
+            session.get_peer_sess_id()
+        );
+
+        self.write_packet(packet, Some(&mut session), None, encode, |wb| {
+            sc_write(wb, SCStatusCodes::CloseSession, &[])
+        })?;
+
+        Ok(())
+    }
+
+    fn is_close_session(payload: &mut [u8]) -> Result<bool, Error> {
+        let mut pb = ParseBuf::new(payload);
+        let report = StatusReport::read(&mut pb)?;
+
+        let close_session = report.proto_id == PROTO_ID_SECURE_CHANNEL as u32
+            && report.proto_code == SCStatusCodes::CloseSession as u16;
+
+        Ok(close_session)
+    }
+
+    async fn netw_recv<R>(mut recv: R, buf: &mut [u8]) -> Result<(usize, Address), Error>
+    where
+        R: NetworkReceive,
+    {
+        match recv.recv_from(buf).await {
+            Ok((len, addr)) => {
+                trace!("\n>>RCV {} {}B:\n     {}", addr, len, Bytes(&buf[..len]));
+
+                Ok((len, addr))
+            }
+            Err(e) => {
+                error!("FAILED network recv: {:?}", e);
+
+                Err(e)
+            }
+        }
+    }
+
+    async fn netw_send<S>(
+        send: &IfMutex<S>,
+        peer: Address,
+        data: &[u8],
+        system: bool,
+    ) -> Result<(), Error>
+    where
+        S: NetworkSend,
+    {
+        match send.lock().await.send_to(data, peer).await {
+            Ok(_) => {
+                trace!(
+                    "\n<<SND {} {}B{}: {}",
+                    peer,
+                    data.len(),
+                    if system { " (system)" } else { "" },
+                    Bytes(data)
+                );
+
+                Ok(())
+            }
+            Err(e) => {
+                error!(
+                    "\n<<SND {} {}B{} !FAILED!: {:?}",
+                    peer,
+                    data.len(),
+                    if system { " (system)" } else { "" },
+                    e
+                );
+
+                // Do not return an error as that would unroll the main `rs-matter` loop
+                // and sending errors are normal and can happen for various reasons
+                // TODO: Provide the error as a feedback to the packet creator instead, in the mutex data
+                Ok(())
+            }
+        }
+    }
+
+    #[inline(always)]
+    const fn transport(&self) -> &Transport {
+        self.matter.transport()
+    }
+}
+
+#[derive(Copy, Clone, Default, PartialEq, Eq, Debug, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub(crate) enum TxPayloadState {
+    #[default]
+    Encoded,
+    NotEncoded {
+        session_id: u32,
+    },
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub(crate) struct TxInfo {
+    pub(crate) retransmission: bool,
+    pub(crate) payload_state: TxPayloadState,
+}
+
+impl TxInfo {
+    pub const fn new() -> Self {
+        Self {
+            retransmission: false,
+            payload_state: TxPayloadState::Encoded,
+        }
+    }
+}
+
+impl Default for TxInfo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// The internal representation of a packet in the transport layer.
+// There are only two such packets - RX and TX.
+//
+// This type is only known and used by the `transport` and the `exchange` modules
+pub(crate) struct Packet<const N: usize> {
+    pub(crate) peer: Address,
+    pub(crate) header: PacketHdr,
+    pub(crate) buf: PacketBuffer<N>,
+    pub(crate) payload_start: usize,
+    pub(crate) tx_info: TxInfo,
+}
+
+impl<const N: usize> Packet<N> {
+    #[inline(always)]
+    pub(crate) const fn new() -> Self {
+        Self {
+            peer: Address::new(),
+            header: PacketHdr::new(),
+            buf: PacketBuffer::new(),
+            payload_start: 0,
+            tx_info: TxInfo::new(),
+        }
+    }
+
+    pub(crate) fn init() -> impl Init<Self> {
+        init!(Self {
+            peer: Address::new(),
+            header: PacketHdr::new(),
+            buf <- PacketBuffer::init(),
+            payload_start: 0,
+            tx_info: TxInfo::new(),
+        })
+    }
+
+    #[cfg(feature = "defmt")]
+    pub fn display<'a>(
+        peer: &'a Address,
+        header: &'a PacketHdr,
+    ) -> impl Display + defmt::Format + 'a {
+        PacketInfo(peer, header)
+    }
+
+    #[cfg(not(feature = "defmt"))]
+    pub fn display<'a>(peer: &'a Address, header: &'a PacketHdr) -> impl Display + 'a {
+        PacketInfo(peer, header)
+    }
+
+    #[cfg(feature = "defmt")]
+    pub fn display_payload<'a>(
+        proto: &'a ProtoHdr,
+        buf: &'a [u8],
+    ) -> impl Display + defmt::Format + 'a {
+        DetailedPacketInfo(proto, buf)
+    }
+
+    #[cfg(not(feature = "defmt"))]
+    pub fn display_payload<'a>(proto: &'a ProtoHdr, buf: &'a [u8]) -> impl Display + 'a {
+        DetailedPacketInfo(proto, buf)
+    }
+
+    fn fmt(f: &mut fmt::Formatter<'_>, peer: &Address, header: &PacketHdr) -> fmt::Result {
+        write!(f, "{peer} {header}")?;
+
+        if header.proto.is_decoded() {
+            let meta = MessageMeta::from(&header.proto);
+
+            write!(f, "\n      {meta}")?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "defmt")]
+    fn format(f: defmt::Formatter<'_>, peer: &Address, header: &PacketHdr) {
+        defmt::write!(f, "{} {}", peer, header);
+
+        if header.proto.is_decoded() {
+            let meta = MessageMeta::from(&header.proto);
+
+            defmt::write!(f, "\n      {}", meta);
+        }
+    }
+
+    fn fmt_payload(f: &mut fmt::Formatter<'_>, proto: &ProtoHdr, buf: &[u8]) -> fmt::Result {
+        let meta = MessageMeta::from(proto);
+
+        write!(f, "{meta}")?;
+
+        if meta.is_tlv() {
+            write!(
+                f,
+                "; TLV:\n----------------\n{}\n----------------\n",
+                TLVElement::new(buf)
+            )?;
+        } else {
+            write!(
+                f,
+                "; Payload:\n----------------\n{:02x?}\n----------------\n",
+                buf
+            )?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "defmt")]
+    fn format_payload(f: defmt::Formatter<'_>, proto: &ProtoHdr, buf: &[u8]) {
+        let meta = MessageMeta::from(proto);
+
+        defmt::write!(f, "{}", meta);
+
+        if meta.is_tlv() {
+            defmt::write!(
+                f,
+                "; TLV:\n----------------\n{}\n----------------\n",
+                TLVElement::new(buf)
+            );
+        } else {
+            defmt::write!(
+                f,
+                "; Payload:\n----------------\n{}\n----------------\n",
+                crate::fmt::Bytes(buf)
+            );
+        }
+    }
+}
+
+impl<const N: usize> Display for Packet<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Self::fmt(f, &self.peer, &self.header)
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl<const N: usize> defmt::Format for Packet<N> {
+    fn format(&self, f: defmt::Formatter<'_>) {
+        Self::format(f, &self.peer, &self.header)
+    }
+}
+
+struct PacketInfo<'a>(&'a Address, &'a PacketHdr);
+
+impl Display for PacketInfo<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Packet::<0>::fmt(f, self.0, self.1)
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for PacketInfo<'_> {
+    fn format(&self, f: defmt::Formatter<'_>) {
+        Packet::<0>::format(f, self.0, self.1)
+    }
+}
+
+struct DetailedPacketInfo<'a>(&'a ProtoHdr, &'a [u8]);
+
+impl Display for DetailedPacketInfo<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Packet::<0>::fmt_payload(f, self.0, self.1)
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for DetailedPacketInfo<'_> {
+    fn format(&self, f: defmt::Formatter<'_>) {
+        Packet::<0>::format_payload(f, self.0, self.1)
+    }
+}
+
+// The buffer used inside the pair of RX and TX `Packet` instances.
+//
+// The payload is allocated inline. With `large-buffers` enabled the inner
+// `Vec` is ~1 MiB, so prefer constructing the buffer in place via
+// [`PacketBuffer::init`].
+// Constructing one by value with `new()` works too, as long as the resulting
+// `Matter` is not moved through a small stack.
+//
+// This type is only known and used by the `transport` and the `exchange` modules
+pub(crate) struct PacketBuffer<const N: usize> {
+    buffer: crate::utils::storage::Vec<u8, N>,
+}
+
+impl<const N: usize> PacketBuffer<N> {
+    pub const fn new() -> Self {
+        Self {
+            buffer: crate::utils::storage::Vec::new(),
+        }
+    }
+
+    pub fn init() -> impl Init<Self> {
+        init!(Self {
+            buffer <- crate::utils::storage::Vec::init(),
+        })
+    }
+
+    pub fn buf_mut(&mut self) -> &mut crate::utils::storage::Vec<u8, N> {
+        &mut self.buffer
+    }
+
+    pub fn buf_ref(&self) -> &crate::utils::storage::Vec<u8, N> {
+        &self.buffer
+    }
+}
+
+impl<const N: usize> Deref for PacketBuffer<N> {
+    type Target = crate::utils::storage::Vec<u8, N>;
+
+    fn deref(&self) -> &Self::Target {
+        self.buf_ref()
+    }
+}
+
+impl<const N: usize> DerefMut for PacketBuffer<N> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.buf_mut()
+    }
+}
+
+// Represents the fact that either `Transport` or some `Exchange` instace has an exclusive access to the
+// RX or TX packet of the transport layer.
+//
+// At any point in time, either the `Transport` singleton, or exactly one `Exchange` instance, or nobody
+// holds a lock on the RX or TX packet. This is enforced by protecting the packets with an `IfMutex` asynchronous mutex.
+//
+// This type is only known and used by the `transport` and the `exchange` modules
+pub(crate) struct PacketAccess<'a, const N: usize>(IfMutexGuard<'a, Packet<N>>, bool);
+
+impl<const N: usize> PacketAccess<'_, N> {
+    pub fn clear_on_drop(&mut self, clear: bool) {
+        self.1 = clear;
+    }
+}
+
+impl<const N: usize> Deref for PacketAccess<'_, N> {
+    type Target = Packet<N>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<const N: usize> DerefMut for PacketAccess<'_, N> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<const N: usize> Drop for PacketAccess<'_, N> {
+    fn drop(&mut self) {
+        if self.1 {
+            self.buf.clear();
+        }
+    }
+}
+
+impl<const N: usize> Display for PacketAccess<'_, N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+// Allows other code in `rs-matter` to (ab)use the packet buffers of the transport layer
+// in case it needs temporary access to a `&mut [u8]`-shaped memory
+//
+// Used by the builtin mDNS responder, as well as by the QR code generator
+pub struct PacketBufferExternalAccess<'a, const N: usize>(pub(crate) &'a IfMutex<Packet<N>>);
+
+impl<const N: usize> Buffers<[u8]> for PacketBufferExternalAccess<'_, N> {
+    type Buffer<'b>
+        = ExternalPacketBuffer<'b, N>
+    where
+        Self: 'b;
+
+    async fn get(&self) -> Option<ExternalPacketBuffer<'_, N>> {
+        let mut packet = self.0.lock_if(|packet| packet.buf.is_empty()).await;
+
+        // TODO: Resizing might be a bit expensive with large buffers
+        // Resizing to `N` is always safe because the size of `buf` heapless vec is `N`
+        unwrap!(packet.buf.resize_default(N));
+
+        Some(ExternalPacketBuffer(packet))
+    }
+
+    fn get_immediate(&self) -> Option<Self::Buffer<'_>> {
+        self.0
+            .try_lock_if(|packet| packet.buf.is_empty())
+            .ok()
+            .map(|mut packet| {
+                // TODO: Resizing might be a bit expensive with large buffers
+                // Resizing to `N` is always safe because the size of `buf` heapless vec is `N`
+                unwrap!(packet.buf.resize_default(N));
+
+                ExternalPacketBuffer(packet)
+            })
+    }
+}
+
+// Wraps the RX or TX packet of the transport manager in something that looks like a `&mut [u8]` buffer.
+pub struct ExternalPacketBuffer<'a, const N: usize>(IfMutexGuard<'a, Packet<N>>);
+
+impl<const N: usize> Deref for ExternalPacketBuffer<'_, N> {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0.buf
+    }
+}
+
+impl<const N: usize> DerefMut for ExternalPacketBuffer<'_, N> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0.buf
+    }
+}
+
+impl<const N: usize> Drop for ExternalPacketBuffer<'_, N> {
+    fn drop(&mut self) {
+        self.0.buf.clear();
+    }
+}
+
+/// The number of messages sent and received by the transport layer.
+#[derive(Default, Clone, Eq, PartialEq, Debug, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct MessageCounters {
+    /// The number of IM messages sent by the transport layer.
+    pub im_sent: u32,
+    /// The number of IM messages received by the transport layer.
+    pub im_received: u32,
+}
+
+impl MessageCounters {
+    const fn new() -> Self {
+        Self {
+            im_sent: 0,
+            im_received: 0,
+        }
+    }
+
+    fn record_sent(&mut self, hdr: &ProtoHdr) {
+        if hdr.proto_id == PROTO_ID_INTERACTION_MODEL {
+            self.im_sent = self.im_sent.saturating_add(1);
+        }
+    }
+
+    fn record_recv(&mut self, hdr: &ProtoHdr) {
+        if hdr.proto_id == PROTO_ID_INTERACTION_MODEL {
+            self.im_received = self.im_received.saturating_add(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::test_only_crypto;
+    use crate::dm::devices::test::{TEST_DEV_ATT, TEST_DEV_COMM, TEST_DEV_DET};
+
+    fn test_matter() -> Matter<'static> {
+        Matter::new(&TEST_DEV_DET, TEST_DEV_COMM, &TEST_DEV_ATT, 0)
+    }
+
+    fn fill_rx_sessions(matter: &Matter<'_>, reserved: bool, active: bool) {
+        matter.with_state(|state| {
+            for _ in 0..session::MAX_SESSIONS {
+                let session = state
+                    .sessions
+                    .add(0, reserved, Address::new(), Some(999), matter.dev_det())
+                    .unwrap();
+                if active {
+                    session
+                        .add_exch(1, Role::Responder(Default::default()))
+                        .unwrap();
+                }
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    fn rx_handshake<C: Crypto>(crypto: &C, opcode: OpCode) -> Packet<128> {
+        let mut packet = Packet::new();
+        packet.header.plain.ctr = 1;
+        packet.header.plain.set_src_nodeid(Some(1234));
+        packet.header.proto.exch_id = 42;
+        packet.header.proto.set_initiator();
+        let meta: MessageMeta = opcode.into();
+        meta.set_into(&mut packet.header.proto);
+
+        let mut bytes = [0; 128];
+        let mut wb = WriteBuf::new_with(&mut bytes, PacketHdr::HDR_RESERVE, PacketHdr::HDR_RESERVE);
+        wb.append(&[1, 2, 3, 4]).unwrap();
+        packet.header.encode(crypto, None, 0, &mut wb).unwrap();
+        packet.buf.extend_from_slice(wb.as_slice()).unwrap();
+        packet
+    }
+
+    #[test]
+    fn rx_session_admission_retries_original_handshake_after_eviction() {
+        use futures_lite::future::block_on;
+
+        for opcode in [OpCode::CASESigma1, OpCode::PBKDFParamRequest] {
+            let matter = test_matter();
+            let crypto = test_only_crypto();
+            let runner = TransportRunner::new(&matter, &crypto);
+            fill_rx_sessions(&matter, false, false);
+            let mut packet = rx_handshake(&crypto, opcode);
+            let original = packet.buf.clone();
+
+            assert!(block_on(runner.decode_packet_with_eviction(&mut packet)).unwrap());
+            assert_eq!(&packet.buf[..], &original[..]);
+            assert_eq!(&packet.buf[packet.payload_start..], &[1, 2, 3, 4]);
+            assert_eq!(packet.header.proto.exch_id, 42);
+            assert!(packet.header.proto.is_initiator());
+            matter.with_state(|state| {
+                assert_eq!(state.sessions.iter().count(), session::MAX_SESSIONS);
+                let admitted = state
+                    .sessions
+                    .get_for_rx(&packet.peer, &packet.header.plain)
+                    .unwrap();
+                assert_eq!(admitted.get_peer_node_id(), Some(1234));
+                assert!(admitted.exchanges.iter().any(Option::is_some));
+            });
+            let mut duplicate = rx_handshake(&crypto, opcode);
+            let err = block_on(runner.decode_packet_with_eviction(&mut duplicate)).unwrap_err();
+            assert!(matches!(err.code(), ErrorCode::Duplicate));
+            let tx = block_on(matter.transport().get_if_tx(|_| true));
+            assert!(!tx.buf.is_empty());
+            assert!(MessageMeta::from(&tx.header.proto).is_sc_status());
+        }
+    }
+
+    #[test]
+    fn rx_session_admission_preserves_reserved_and_active_sessions() {
+        use futures_lite::future::block_on;
+
+        for (reserved, active) in [(true, false), (false, true)] {
+            let matter = test_matter();
+            let crypto = test_only_crypto();
+            let runner = TransportRunner::new(&matter, &crypto);
+            fill_rx_sessions(&matter, reserved, active);
+            let mut packet = rx_handshake(&crypto, OpCode::CASESigma1);
+            let original = packet.buf.clone();
+
+            let err = block_on(runner.decode_packet_with_eviction(&mut packet)).unwrap_err();
+            assert!(matches!(err.code(), ErrorCode::NoSpaceSessions));
+            assert_eq!(&packet.buf[..], &original[..]);
+            matter.with_state(|state| {
+                assert_eq!(state.sessions.iter().count(), session::MAX_SESSIONS);
+                assert!(state
+                    .sessions
+                    .get_for_rx(&packet.peer, &packet.header.plain)
+                    .is_none());
+            });
+            let tx = block_on(matter.transport().get_if_tx(|_| true));
+            assert!(tx.buf.is_empty());
+        }
+    }
+
+    #[test]
+    fn rx_session_admission_without_pressure_does_not_evict() {
+        use futures_lite::future::block_on;
+
+        let matter = test_matter();
+        let crypto = test_only_crypto();
+        let runner = TransportRunner::new(&matter, &crypto);
+        let mut packet = rx_handshake(&crypto, OpCode::CASESigma1);
+
+        assert!(block_on(runner.decode_packet_with_eviction(&mut packet)).unwrap());
+        matter.with_state(|state| assert_eq!(state.sessions.iter().count(), 1));
+        let tx = block_on(matter.transport().get_if_tx(|_| true));
+        assert!(tx.buf.is_empty());
+    }
+
+    #[test]
+    fn rx_session_admission_does_not_evict_for_non_handshake_messages() {
+        use futures_lite::future::block_on;
+
+        let matter = test_matter();
+        let crypto = test_only_crypto();
+        let runner = TransportRunner::new(&matter, &crypto);
+        fill_rx_sessions(&matter, false, false);
+        let mut packet = rx_handshake(&crypto, OpCode::MRPStandAloneAck);
+
+        let err = block_on(runner.decode_packet_with_eviction(&mut packet)).unwrap_err();
+        assert!(matches!(err.code(), ErrorCode::NoSession));
+        matter.with_state(|state| assert_eq!(state.sessions.iter().count(), session::MAX_SESSIONS));
+        let tx = block_on(matter.transport().get_if_tx(|_| true));
+        assert!(tx.buf.is_empty());
+    }
+
+    #[test]
+    fn rx_session_admission_does_not_evict_for_unknown_encrypted_sessions() {
+        use futures_lite::future::block_on;
+
+        let matter = test_matter();
+        let crypto = test_only_crypto();
+        let runner = TransportRunner::new(&matter, &crypto);
+        fill_rx_sessions(&matter, false, false);
+        let mut packet = Packet::<128>::new();
+        let mut bytes = [0; 128];
+        let mut wb = WriteBuf::new(&mut bytes);
+        let mut header = plain_hdr::PlainHdr::new();
+        header.sess_id = 42;
+        header.ctr = 1;
+        header.encode(&mut wb).unwrap();
+        packet.buf.extend_from_slice(wb.as_slice()).unwrap();
+
+        let err = block_on(runner.decode_packet_with_eviction(&mut packet)).unwrap_err();
+        assert!(matches!(err.code(), ErrorCode::NoSession));
+        matter.with_state(|state| assert_eq!(state.sessions.iter().count(), session::MAX_SESSIONS));
+        let tx = block_on(matter.transport().get_if_tx(|_| true));
+        assert!(tx.buf.is_empty());
+    }
+
+    #[test]
+    fn rx_session_admission_still_sends_busy_when_all_sessions_are_protected() {
+        use futures_lite::future::block_on;
+
+        struct BusySender(usize);
+
+        impl NetworkSend for BusySender {
+            async fn send_to(&mut self, data: &[u8], addr: Address) -> Result<(), Error> {
+                assert_eq!(addr, Address::new());
+                let crypto = test_only_crypto();
+                let mut bytes = data.to_vec();
+                let mut pb = ParseBuf::new(&mut bytes);
+                let mut header = PacketHdr::new();
+                header.decode_plain_hdr(&mut pb)?;
+                header.decode_remaining(&crypto, None, 0, &mut pb)?;
+                assert!(MessageMeta::from(&header.proto).is_sc_status());
+                assert_eq!(header.proto.exch_id, 42);
+                assert!(!header.proto.is_initiator());
+                let report = StatusReport::read(&mut pb)?;
+                assert_eq!(report.proto_code, SCStatusCodes::Busy as u16);
+                assert_eq!(report.proto_data, &500_u16.to_le_bytes());
+                self.0 += 1;
+                Ok(())
+            }
+        }
+
+        for (reserved, active) in [(true, false), (false, true)] {
+            let matter = test_matter();
+            let crypto = test_only_crypto();
+            let runner = TransportRunner::new(&matter, &crypto);
+            fill_rx_sessions(&matter, reserved, active);
+            let mut packet = rx_handshake(&crypto, OpCode::CASESigma1);
+            let send = IfMutex::new(BusySender(0));
+
+            assert!(!block_on(runner.handle_rx_packet(&mut packet, &send)).unwrap());
+            assert_eq!(block_on(send.lock()).0, 1);
+            matter.with_state(|state| {
+                assert_eq!(state.sessions.iter().count(), session::MAX_SESSIONS);
+            });
+        }
+    }
+
+    #[test]
+    fn test_create_plaintext_session() {
+        let matter = test_matter();
+        let crypto = test_only_crypto();
+        let peer = Address::new();
+
+        let session_id = matter
+            .transport
+            .create_plaintext_session(&matter, &crypto, peer)
+            .unwrap();
+
+        matter.with_state(|state| {
+            let session = state.sessions.get(session_id).unwrap();
+
+            assert_eq!(session.id, session_id);
+            assert!(!session.is_encrypted());
+            assert_eq!(session.get_peer_node_id(), None);
+            assert_eq!(*session.get_session_mode(), session::SessionMode::PlainText);
+        });
+    }
+
+    #[test]
+    fn test_initiate_plaintext_now_creates_initiator_exchange() {
+        let matter = test_matter();
+        let crypto = test_only_crypto();
+        let peer = Address::new();
+
+        let exchange = matter
+            .transport
+            .try_initiate_plaintext(&matter, &crypto, peer)
+            .unwrap();
+
+        exchange
+            .with_state(|state| {
+                let sess = exchange.id().session(&mut state.sessions);
+                let exch = exchange.id().exch(sess);
+
+                assert!(matches!(exch.role, Role::Initiator(_)));
+                assert_eq!(sess.id, exchange.id().session_id());
+                Ok(())
+            })
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
+
+    use futures_lite::future::{block_on, zip};
+
+    use crate::error::ErrorCode;
+    use crate::test::test_matter;
+    use crate::transport::network::mdns::{DottedName, MdnsRemoteService, MAX_RESOLVE_CANDIDATES};
+    use crate::transport::network::MatterRemoteService;
+
+    fn op_service() -> MatterRemoteService {
+        MatterRemoteService::Operational {
+            compressed_fabric_id: 0x1122,
+            node_id: 0x3344,
+        }
+    }
+
+    /// A resolver and the responder rendezvous on the single in-flight slot: the
+    /// responder picks up the request and deposits an answer, which the resolver
+    /// returns as the resolved `Address`.
+    #[test]
+    fn resolve_rendezvous_delivers_answer() {
+        let matter = test_matter();
+        let service = op_service();
+
+        let resolved = block_on(async {
+            let resolver = matter.transport().resolve(service.clone(), 5_000);
+
+            let responder = async {
+                let picked = matter.transport().wait_mdns_resolve_request().await;
+                assert_eq!(picked, service);
+
+                let mut name = heapless::String::<128>::new();
+                service.instance_name(&mut name);
+
+                let answer = MdnsRemoteService {
+                    instance_name: DottedName(name.as_str()),
+                    port: Some(1234),
+                    addrs: [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))].into_iter(),
+                    txt: [("SII", "300"), ("SAI", "4000"), ("SAT", "5000")].into_iter(),
+                    scope_id: 0,
+                };
+
+                matter.transport().try_deposit_mdns_resolve(&answer, &[]);
+            };
+
+            let (node, ()) = zip(resolver, responder).await;
+            node
+        })
+        .unwrap();
+
+        assert_eq!(
+            resolved.addr(),
+            Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+                1234
+            ))
+        );
+        // The peer's MRP/session params are carried out of the resolve TXT.
+        assert_eq!(resolved.sii, Some(300));
+        assert_eq!(resolved.sai, Some(4000));
+        assert_eq!(resolved.sat, Some(5000));
+    }
+
+    /// An answer carrying several addresses yields all of them, ranked best
+    /// first, so the CASE initiator has alternatives to fall back to when the
+    /// top-ranked one turns out to be unreachable.
+    #[test]
+    fn resolve_keeps_all_addresses_ranked() {
+        let matter = test_matter();
+        let service = op_service();
+
+        let link_local = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let gua = Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 1);
+        let ipv4 = Ipv4Addr::new(10, 0, 0, 5);
+
+        let resolved = block_on(async {
+            let resolver = matter.transport().resolve(service.clone(), 5_000);
+
+            let responder = async {
+                matter.transport().wait_mdns_resolve_request().await;
+
+                let mut name = heapless::String::<128>::new();
+                service.instance_name(&mut name);
+
+                // Deposited worst-first and in packet order.
+                let answer = MdnsRemoteService {
+                    instance_name: DottedName(name.as_str()),
+                    port: Some(1234),
+                    addrs: [IpAddr::V4(ipv4), IpAddr::V6(gua), IpAddr::V6(link_local)].into_iter(),
+                    txt: core::iter::empty::<(&str, &str)>(),
+                    scope_id: 7,
+                };
+
+                matter.transport().try_deposit_mdns_resolve(&answer, &[]);
+            };
+
+            let (node, ()) = zip(resolver, responder).await;
+            node
+        })
+        .unwrap();
+
+        // Truncated to whatever `MAX_RESOLVE_CANDIDATES` is configured to, so
+        // this holds for every `max-resolve-candidates-*` feature.
+        let expected = [
+            // Only the link-local candidate carries the scope id.
+            SocketAddr::V6(SocketAddrV6::new(link_local, 1234, 0, 7)),
+            SocketAddr::new(IpAddr::V6(gua), 1234),
+            SocketAddr::new(IpAddr::V4(ipv4), 1234),
+        ];
+
+        assert_eq!(
+            resolved.addrs.as_slice(),
+            &expected[..expected.len().min(MAX_RESOLVE_CANDIDATES)]
+        );
+    }
+
+    /// A backend that surfaces one address per callback (zeroconf, Avahi) still
+    /// accumulates candidates: successive deposits against the same in-flight
+    /// target merge into the ranked list instead of replacing it, and TXT-less
+    /// deposits do not clobber session params already resolved.
+    #[test]
+    fn resolve_merges_successive_single_address_deposits() {
+        let matter = test_matter();
+        let service = op_service();
+
+        let gua = Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 1);
+        let link_local = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+
+        let resolved = block_on(async {
+            let resolver = matter.transport().resolve(service.clone(), 5_000);
+
+            let responder = async {
+                matter.transport().wait_mdns_resolve_request().await;
+
+                let mut name = heapless::String::<128>::new();
+                service.instance_name(&mut name);
+
+                // First callback: the routable address, carrying the TXT. Both
+                // deposits run back-to-back without an await in between, so they
+                // land before the resolver is polled again.
+                matter.transport().try_deposit_mdns_resolve(
+                    &MdnsRemoteService {
+                        instance_name: DottedName(name.as_str()),
+                        port: Some(1234),
+                        addrs: core::iter::once(IpAddr::V6(gua)),
+                        txt: [("SII", "300")].into_iter(),
+                        scope_id: 0,
+                    },
+                    &[],
+                );
+
+                // Second callback: the link-local address, no TXT.
+                matter.transport().try_deposit_mdns_resolve(
+                    &MdnsRemoteService {
+                        instance_name: DottedName(name.as_str()),
+                        port: Some(1234),
+                        addrs: core::iter::once(IpAddr::V6(link_local)),
+                        txt: core::iter::empty::<(&str, &str)>(),
+                        scope_id: 7,
+                    },
+                    &[],
+                );
+            };
+
+            let (node, ()) = zip(resolver, responder).await;
+            node
+        })
+        .unwrap();
+
+        let expected = [
+            SocketAddr::V6(SocketAddrV6::new(link_local, 1234, 0, 7)),
+            SocketAddr::new(IpAddr::V6(gua), 1234),
+        ];
+
+        assert_eq!(
+            resolved.addrs.as_slice(),
+            &expected[..expected.len().min(MAX_RESOLVE_CANDIDATES)]
+        );
+        // The TXT-less second deposit did not clobber the first one's params.
+        assert_eq!(resolved.sii, Some(300));
+    }
+
+    /// Without a responder, a resolve times out and releases the slot (drop-clean),
+    /// so a subsequent resolve also simply times out rather than hanging.
+    #[test]
+    fn resolve_times_out_and_releases_slot() {
+        let matter = test_matter();
+
+        let err = block_on(matter.transport().resolve(op_service(), 50)).unwrap_err();
+        assert!(matches!(err.code(), ErrorCode::NotFound));
+
+        let err = block_on(matter.transport().resolve(op_service(), 50)).unwrap_err();
+        assert!(matches!(err.code(), ErrorCode::NotFound));
+    }
+
+    /// Depositing an answer with no in-flight request is a no-op (does not strand
+    /// a phantom answer): a later resolve still times out.
+    #[test]
+    fn deposit_without_request_is_noop() {
+        let matter = test_matter();
+
+        let mut name = heapless::String::<128>::new();
+        op_service().instance_name(&mut name);
+        let answer = MdnsRemoteService {
+            instance_name: DottedName(name.as_str()),
+            port: Some(1234),
+            addrs: [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9))].into_iter(),
+            txt: core::iter::empty::<(&str, &str)>(),
+            scope_id: 0,
+        };
+        matter.transport().try_deposit_mdns_resolve(&answer, &[]);
+
+        let err = block_on(matter.transport().resolve(op_service(), 50)).unwrap_err();
+        assert!(matches!(err.code(), ErrorCode::NotFound));
+    }
+}
+
+#[cfg(test)]
+mod browse_tests {
+    use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use futures_lite::future::{block_on, zip};
+
+    use crate::error::ErrorCode;
+    use crate::test::test_matter;
+    use crate::transport::network::mdns::{CommissionableFilter, DottedName, MdnsRemoteService};
+    use crate::transport::network::Address;
+
+    /// A browser and the responder rendezvous: the responder picks up the request,
+    /// deposits a matching commissionable answer, and the browser returns its
+    /// address + commissionable instance id.
+    #[test]
+    fn browse_rendezvous_delivers_first_match() {
+        let matter = test_matter();
+
+        let filter = CommissionableFilter {
+            discriminator: Some(0xA5A),
+            vendor_id: Some(0xFFF1),
+            ..Default::default()
+        };
+
+        let found = block_on(async {
+            let browser = matter
+                .transport()
+                .browse_commissionable(&filter, &[], 5_000);
+
+            let responder = async {
+                let picked = matter.transport().wait_mdns_browse_request().await;
+                assert_eq!(picked, filter);
+
+                // A non-matching node (wrong vendor) must be ignored.
+                let other = MdnsRemoteService {
+                    instance_name: DottedName("0000000000000001._matterc._udp.local"),
+                    port: Some(5540),
+                    addrs: [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))].into_iter(),
+                    txt: [("D", "2650"), ("VP", "9999+1"), ("CM", "1")].into_iter(),
+                    scope_id: 0,
+                };
+                matter.transport().try_deposit_mdns_browse(&other);
+
+                // The matching node (D=0xA5A=2650, VP vendor 0xFFF1=65521).
+                let answer = MdnsRemoteService {
+                    instance_name: DottedName("00000000ABCD1234._matterc._udp.local"),
+                    port: Some(5541),
+                    addrs: [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7))].into_iter(),
+                    txt: [("D", "2650"), ("VP", "65521+42"), ("CM", "1")].into_iter(),
+                    scope_id: 0,
+                };
+                matter.transport().try_deposit_mdns_browse(&answer);
+            };
+
+            let (found, ()) = zip(browser, responder).await;
+            found
+        })
+        .unwrap();
+
+        assert_eq!(
+            found,
+            (
+                Address::Udp(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)),
+                    5541
+                )),
+                0x00000000ABCD1234,
+            )
+        );
+    }
+
+    /// Without a responder, a browse times out and releases the slot (drop-clean).
+    #[test]
+    fn browse_times_out_and_releases_slot() {
+        let matter = test_matter();
+        let filter = CommissionableFilter {
+            short_discriminator: Some(0xA),
+            ..Default::default()
+        };
+
+        let err = block_on(matter.transport().browse_commissionable(&filter, &[], 50)).unwrap_err();
+        assert!(matches!(err.code(), ErrorCode::NotFound));
+
+        let err = block_on(matter.transport().browse_commissionable(&filter, &[], 50)).unwrap_err();
+        assert!(matches!(err.code(), ErrorCode::NotFound));
+    }
+
+    /// `exclude` steps past an already-tried candidate: with two nodes sharing the
+    /// (short) discriminator, excluding the first id yields the second.
+    #[test]
+    fn browse_exclude_steps_to_next_match() {
+        let matter = test_matter();
+
+        // Short discriminator 0xA = top 4 bits of 0xA12 (2578) and 0xAFF (2815).
+        let filter = CommissionableFilter {
+            short_discriminator: Some(0xA),
+            ..Default::default()
+        };
+
+        // Both nodes match the filter; exclude the first id, expect the second.
+        let found = block_on(async {
+            let browser = matter
+                .transport()
+                .browse_commissionable(&filter, &[0x1111], 5_000);
+
+            let responder = async {
+                matter.transport().wait_mdns_browse_request().await;
+
+                let node_a = MdnsRemoteService {
+                    instance_name: DottedName("0000000000001111._matterc._udp.local"),
+                    port: Some(5540),
+                    addrs: [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))].into_iter(),
+                    txt: [("D", "2578"), ("CM", "1")].into_iter(), // 0xA12, short 0xA
+                    scope_id: 0,
+                };
+                // Excluded id -> ignored.
+                matter.transport().try_deposit_mdns_browse(&node_a);
+
+                let node_b = MdnsRemoteService {
+                    instance_name: DottedName("0000000000002222._matterc._udp.local"),
+                    port: Some(5541),
+                    addrs: [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))].into_iter(),
+                    txt: [("D", "2815"), ("CM", "1")].into_iter(), // 0xAFF, short 0xA
+                    scope_id: 0,
+                };
+                matter.transport().try_deposit_mdns_browse(&node_b);
+            };
+
+            let (found, ()) = zip(browser, responder).await;
+            found
+        })
+        .unwrap();
+
+        assert_eq!(
+            found,
+            (
+                Address::Udp(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+                    5541
+                )),
+                0x2222,
+            )
+        );
+    }
+}

@@ -1763,8 +1763,6 @@ checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 [[package]]
 name = "rs-matter"
 version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c446621e934ed3b3e784cd2fd97ab7c3deb50758c8f3d1b5829c0acd245ad78"
 dependencies = [
  "bitflags 2.13.2",
  "cfg-if",

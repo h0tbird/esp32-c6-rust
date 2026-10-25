@@ -16,3 +16,6 @@ embassy-sync = "0.8"
 embassy-time = { version = "0.5", features = ["std"] }
 rs-matter = { version = "=0.4.1", default-features = false, features = ["std", "defmt"] }
 smart-leds = "0.4.0"
+
+[patch.crates-io]
+rs-matter = { path = "../../vendor/rs-matter" }
