@@ -244,7 +244,17 @@ cargo run --release
 ```
 
 Expect the same red, green, cyan, blue, and magenta sequence, with 500 ms on and 500 ms off.
-The async conversion has not yet been verified on the physical board.
+On 2026-10-25, the diagnostic release build was flashed to the ESP32-C6-DevKitC-1.
+Serial monitoring showed five complete color cycles with a measured on-time of 500 ms
+for every color, including magenta, and no unexpected restart during the observation.
+This verifies the reported software timing on hardware, not the perceived duration of the emitted light.
+
+If a color appears to turn off too soon, compare the serial logs from `cargo run --release`.
+Each color has the same 500 ms timer, and the firmware logs its measured on-time after sending
+the off command, for example `LED: magenta off after 500 ms`. This measures the software interval,
+including the short off transmission, not the LED's optical output. Small scheduling delays are possible.
+The startup message should appear only once per boot; if it repeats unexpectedly, check the
+surrounding output for a reset or panic rather than assuming the color delay is wrong.
 
 ## Next milestone: Apple Home over Matter and Thread
 

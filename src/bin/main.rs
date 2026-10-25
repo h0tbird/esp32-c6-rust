@@ -9,7 +9,7 @@
 
 use defmt::info;
 use embassy_executor::Spawner;
-use embassy_time::Timer;
+use embassy_time::{Instant, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::rmt::Rmt;
@@ -46,6 +46,7 @@ async fn main(_spawner: Spawner) {
         rmt_frequency,
     )
     .expect("Failed to initialize the LED driver");
+    info!("Starting five-color LED loop; each color is on for 500 ms");
 
     // Keep brightness low: each channel ranges from 0 to 255.
     const LEVEL: u8 = 10;
@@ -61,9 +62,15 @@ async fn main(_spawner: Spawner) {
         for (name, color) in colors {
             info!("LED: {}", name);
             led.write([color]).expect("Failed to write LED color");
+            let on_started = Instant::now();
             Timer::after_millis(500).await;
             led.write([RGB8::new(0, 0, 0)])
                 .expect("Failed to turn off LED");
+            info!(
+                "LED: {} off after {} ms",
+                name,
+                on_started.elapsed().as_millis()
+            );
             Timer::after_millis(500).await;
         }
     }
