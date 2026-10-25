@@ -1,0 +1,18 @@
+[package]
+name = "esp32-c6-rust-host-tests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+defmt = { version = "1.0.1", features = ["unstable-test"] }
+embassy-futures = "0.1"
+embassy-sync = "0.8"
+embassy-time = { version = "0.5", features = ["std"] }
+rs-matter = { version = "=0.4.1", default-features = false, features = ["std", "defmt"] }
+smart-leds = "0.4.0"
