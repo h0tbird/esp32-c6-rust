@@ -118,8 +118,8 @@ With the board connected through a supported serial connection, build, flash, an
 cargo run
 ```
 
-This command writes firmware to the connected board. The starter firmware logs "Hello world!" every
-500 milliseconds using `defmt`; the configured runner decodes that output. Press Ctrl+C to exit the monitor.
+This command writes firmware to the connected board. The firmware logs each LED color using `defmt`;
+the configured runner decodes that output. Press Ctrl+C to exit the monitor.
 
 ### Command executed
 
@@ -165,3 +165,26 @@ To check that the dependencies compile together without flashing the board:
 ```sh
 cargo build
 ```
+
+### Blink and cycle through LED colors
+
+The firmware in `src/bin/main.rs` assumes one WS2812-compatible addressable RGB LED connected to
+GPIO8, using WS2812B timing and GRB wire order. Check your board's pinout: this is not the same as
+an ordinary single-color LED, and other boards may use a different pin or LED protocol.
+
+RMT channel 0 generates the LED signal using an 80 MHz peripheral clock. The firmware repeats
+red, green, cyan, blue, and magenta, with each color on for 500 milliseconds
+and the LED off for another 500 milliseconds. `LEVEL` sets the per-channel brightness to 10 out of 255.
+The delays block the CPU, which keeps this first example simple.
+
+Build, flash, and monitor it with:
+
+```sh
+cargo run --release
+```
+
+The driver uses the `RmtSmartLeds` API from `esp-hal-smartled 0.18.0`; older examples using
+`SmartLedsAdapter` and `smart_led_buffer!` do not match this version.
+`SmartLedsWrite` supplies the `write` method, and `[color]` sends one pixel.
+Writing black (`RGB8::new(0, 0, 0)`) turns it off. Initialization or transmission errors
+stop the firmware with a panic rather than being ignored.
