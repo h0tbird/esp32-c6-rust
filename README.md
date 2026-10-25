@@ -320,9 +320,53 @@ No new partition layout or whole-chip erase is required. This is the sequential-
 not ESP-IDF's NVS format; do not share this partition with another firmware's NVS contents.
 
 The same store is supplied to Matter and the Thread transport so fabric credentials and network
-configuration can be loaded after a restart. The application's On/Off settings use a separate
-vendor key. Flash I/O errors and invalid settings are reported as failures rather than silently
+configuration can be loaded after a restart. The Thread transport reserves vendor key `0x1000`
+for its SRP service-registration key; the application's On/Off settings use `0x1001`.
+Flash I/O errors and invalid settings are reported as failures rather than silently
 discarding pairing. Flash encryption is not configured by this project.
+
+The first integrated firmware incorrectly shared key `0x1000` with Thread. On 2026-10-25,
+startup logs confirmed that pairing credentials loaded, but decoding the overwritten LED
+record caused a panic before networking started. This can show up as **No Response** in Home,
+even with the board close to the Apple TV.
+
+The corrected firmware uses the separate LED key and preserves the existing Matter fabrics,
+network configuration, and Thread SRP record. If the old key still contains a recognizable
+three-byte LED record, it migrates that record before removing it from Thread's slot; Thread
+must then regenerate the SRP key that the old firmware had overwritten. If Thread already
+overwrote the old LED record, its previous On/Off state cannot be recovered: the firmware logs
+that it is initializing the LED off and leaves Thread's data intact. Invalid records at the
+new LED key remain errors, not silent resets.
+
+To apply this fix, close any serial monitor with Ctrl+C and flash the integrated firmware
+normally using the command below. Do not erase NVS or factory-reset as the first troubleshooting
+step. Retest the existing Home accessory after the update; loading credentials alone is not
+proof that Home control has recovered.
+
+After flashing the correction on 2026-10-25, the user's logs confirmed that both saved fabrics
+loaded, LED initialization no longer panicked, and Thread reached `Role detached -> child` and
+`Netif up`. Service discovery still reported `SRP callback error: code=29`: in this SRP context,
+OpenThread maps duplicate DNS names/records to error 29. This is consistent with a stale
+registration or the signing-key collision in the earlier firmware, not proof of lost radio
+connectivity. A `Registered SRP host` message alone only shows local configuration; subsequent
+callback errors mean server acceptance has not succeeded.
+
+As a non-destructive recovery attempt, restart the Apple TV normally (not a factory reset),
+wait for its home-hub connection to recover, then restart the ESP32 and retry the existing
+accessory. This is not guaranteed to clear persisted SRP registrations. Do not erase pairing
+or recreate the Thread network merely to diagnose this error.
+
+Subsequent logs on the same day confirmed saved LED settings loading from `0x1001` after
+another reset, Thread reattachment, and working Matter control without re-pairing. Home briefly
+displayed Off while the board was blinking; after another On/Off attempt, the user confirmed
+the displayed state was consistent. The log showed `Matter LED enabled: false`, followed by
+`LED: off` with no further color cycle. This confirms reset recovery and On/Off operation in
+that test, not long-term reliability or the cause of the transient display mismatch.
+MLE `Failed to process UDP: Duplicated` warnings remained during working control; they are
+distinct from an SRP callback error and do not alone establish that the accessory is unreachable.
+
+Before sharing serial logs publicly, redact the entire `Connecting to Thread network, dataset:`
+line: the dataset contains network credentials. Do not commit raw commissioning logs.
 
 The Thread EUI-64, commissioning discriminator, serial number, and Basic Information unique ID
 are derived from the chip's factory MAC address. They remain stable across reboots and reflashing.
@@ -469,6 +513,23 @@ They cover all five colors and black intervals, Off at every sequence phase, res
 the 500 ms interval constant, valid settings round-trips, rejection of malformed settings,
 and deterministic board-specific identity. They do not substitute for radio or Apple Home tests.
 
+To also test the actual Matter light hooks and storage migration on this Apple Silicon Mac:
+
+```sh
+CARGO_TARGET_DIR=target/host-tests cargo test \
+  --manifest-path tests/host/Cargo.toml \
+  --locked --target aarch64-apple-darwin
+```
+
+For an Intel Mac, use `--target x86_64-apple-darwin` instead. The explicit host target overrides
+the project's embedded target. This separate test crate compiles the same light modules against
+the real Matter storage interfaces without pulling in the ESP32 HAL; native `defmt` test mode
+is isolated from the firmware build.
+
+The combined suite includes preservation of Thread and fabric records across LED commands and
+reloads, migration of legacy LED records, interrupted migration recovery, failed-write handling,
+and rejection of invalid new records without overwriting stored data.
+
 ### Dependency compatibility
 
 This baseline keeps `esp-hal 1.2.2`, `esp-rtos 0.4.0`, and the current LED driver. It uses:
@@ -487,8 +548,10 @@ uses `defmt`; mixing the HAL's `log-04` and `defmt` features causes a build erro
 
 ### Remaining verification
 
-Apple Home commissioning and actual On/Off control have been confirmed by the user.
-Next, unplug the board, wait five seconds, reconnect it, and confirm the existing accessory
+Apple Home commissioning, control after a reset with saved pairing, and consistent displayed
+On/Off state after retesting have been confirmed by the user.
+To separately verify a full power cycle, unplug the board, wait five seconds, reconnect it,
+and confirm the existing accessory
 responds to On/Off in Home without being added again. Allow time for it to rejoin Thread.
 This verifies paired power-cycle recovery; loading credentials from flash alone does not.
 The physical BOOT factory-reset procedure also remains to be verified.
