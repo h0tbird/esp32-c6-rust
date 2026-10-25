@@ -74,6 +74,17 @@ cargo install esp-generate --locked
 This installs the generator on the Mac; it does not create or modify a firmware project yet.
 `--locked` uses the generator's packaged dependency lockfile, but does not pin the version of `esp-generate` itself.
 
+During project generation, `esp-generate` also requested the missing `esp-config` configuration tool.
+Accepting its prompt installed it with:
+
+```sh
+cargo install esp-config --features=tui --locked
+```
+
+`tui` enables its terminal user interface. Like other Cargo-installed tools, it is placed in
+`~/.cargo/bin`, which must be on `PATH`. It is already installed on this machine; this command
+is recorded for setting up another machine, not something to repeat before each build.
+
 ## Install debugging tools
 
 `probe-rs` can flash and debug supported microcontrollers through a compatible debug probe.
@@ -297,13 +308,23 @@ and volatile storage. These are for experiments, not a certified commercial acce
 
 ### Native build tools on macOS
 
-The networking stack includes C crypto dependencies. The build required CMake and a Clang with
-RISC-V support; Apple's system Clang on this machine does not include that target. These tools
-were installed with:
+The networking stack includes C crypto dependencies. The first build found the following missing tools:
+
+| Tool | Why it was needed | Version installed on 2026-10-25 |
+| --- | --- | --- |
+| CMake | Configures and builds the native MbedTLS crypto library; the first build failed because `cmake` was missing | 4.4.4 |
+| Homebrew LLVM / Clang | Cross-compiles C code for the ESP32-C6's RISC-V processor and provides `libclang` for generating Rust bindings; Apple's system Clang on this machine lacks the RISC-V target | 23.1.4 |
+
+They were installed with the following commands (no need to repeat them on this machine):
 
 ```sh
 brew install cmake llvm
 ```
+
+**Yes, LLVM needs a PATH update for the Matter build.** Homebrew installs LLVM as "keg-only",
+so its `clang` is not selected automatically. Prepending its `bin` directory makes the build
+find it before Apple's `/usr/bin/clang`. CMake is installed in Homebrew's normal `bin` directory,
+which is already on this machine's PATH; it needs no additional entry.
 
 For the following commands, select Homebrew LLVM in the current terminal:
 
@@ -313,7 +334,33 @@ export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
 ```
 
 This does not change your shell configuration. Repeat the exports in a new terminal when building
-the experimental binary. The original blink-only build does not require these native build tools.
+the experimental binary. `LIBCLANG_PATH` points the bindings generator to LLVM's shared libraries;
+it is a separate setting, not another executable search path.
+
+To make these settings persistent, add the same two export lines to `~/.zshrc`, after the existing
+Rust/Cargo PATH entries, and reload it:
+
+```sh
+source ~/.zshrc
+```
+
+This selects Homebrew Clang for other commands in that shell too. If you prefer to leave your
+normal compiler selection alone, use only the temporary exports in a terminal dedicated to this project.
+No shell configuration file was changed automatically.
+
+Check the setup with:
+
+```sh
+command -v cmake
+cmake --version
+command -v clang
+clang --version
+clang --print-targets
+echo "$LIBCLANG_PATH"
+```
+
+`clang` should resolve inside Homebrew's LLVM directory, and its target list should include `riscv32`.
+The original blink-only build does not require these native build tools.
 
 Build without flashing:
 
