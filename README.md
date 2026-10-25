@@ -20,7 +20,10 @@ if Homebrew is installed elsewhere, adjust the path.
 
 ```sh
 export PATH="${PATH}:/opt/homebrew/opt/rustup/bin"
+export PATH="$HOME/.cargo/bin:$PATH"
 ```
+
+The second line makes tools installed with `cargo install`, such as `esp-generate` and `espflash`, available.
 
 Open a new terminal after saving that change. To check for Rust-related lines in the configuration:
 
@@ -94,4 +97,26 @@ cargo install espflash --locked
 `--locked` uses the tool's packaged dependency lockfile for a more reproducible installation;
 it does not pin the version of `espflash` itself.
 
-Flashing still requires a firmware build, the board's connection details, and an appropriate flash command.
+## Build and run the firmware
+
+The generated firmware is now part of this repository; there is no need to run `cargo init` or generate it again.
+The Cargo package and binary retain the generated name `esp32-c6-starter`.
+
+Run this from the repository root to compile without connecting to a board:
+
+```sh
+cargo build
+```
+
+`rust-toolchain.toml` selects stable Rust and requests the Rust source component and ESP32-C6 target.
+`.cargo/config.toml` selects that target automatically and configures `espflash` as the runner.
+`Cargo.lock` records the resolved dependency versions and should be committed with this firmware project.
+
+With the board connected through a supported serial connection, build, flash, and monitor its output with:
+
+```sh
+cargo run
+```
+
+This command writes firmware to the connected board. The starter firmware logs "Hello world!" every
+500 milliseconds using `defmt`; the configured runner decodes that output. Press Ctrl+C to exit the monitor.
