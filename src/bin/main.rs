@@ -17,6 +17,7 @@ use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal_smartled::{RmtSmartLeds, WS2812B_TIMING, buffer_size, color_order};
 use esp_println as _;
+use esp32_c6_rust::light::{COLORS, HALF_PERIOD_MS};
 use smart_leds::{RGB8, SmartLedsWrite};
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
@@ -48,22 +49,13 @@ async fn main(_spawner: Spawner) {
     .expect("Failed to initialize the LED driver");
     info!("Starting five-color LED loop; each color is on for 500 ms");
 
-    // Keep brightness low: each channel ranges from 0 to 255.
-    const LEVEL: u8 = 10;
-    let colors = [
-        ("red", RGB8::new(LEVEL, 0, 0)),
-        ("green", RGB8::new(0, LEVEL, 0)),
-        ("cyan", RGB8::new(0, LEVEL, LEVEL)),
-        ("blue", RGB8::new(0, 0, LEVEL)),
-        ("magenta", RGB8::new(LEVEL, 0, LEVEL)),
-    ];
-
     loop {
-        for (name, color) in colors {
+        for (name, [r, g, b]) in COLORS {
             info!("LED: {}", name);
-            led.write([color]).expect("Failed to write LED color");
+            led.write([RGB8::new(r, g, b)])
+                .expect("Failed to write LED color");
             let on_started = Instant::now();
-            Timer::after_millis(500).await;
+            Timer::after_millis(HALF_PERIOD_MS).await;
             led.write([RGB8::new(0, 0, 0)])
                 .expect("Failed to turn off LED");
             info!(
@@ -71,7 +63,7 @@ async fn main(_spawner: Spawner) {
                 name,
                 on_started.elapsed().as_millis()
             );
-            Timer::after_millis(500).await;
+            Timer::after_millis(HALF_PERIOD_MS).await;
         }
     }
 }

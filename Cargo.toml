@@ -18,9 +18,14 @@ bench = false
 
 [features]
 matter-thread = [
+  "dep:embassy-embedded-hal",
+  "dep:embassy-futures",
+  "dep:embassy-sync",
+  "dep:embedded-storage",
   "dep:esp-alloc",
   "dep:esp-radio",
   "dep:esp-metadata-generated",
+  "dep:esp-storage",
   "dep:portable-atomic",
   "dep:rs-matter-embassy",
   "dep:static_cell",
@@ -50,9 +55,14 @@ esp-rtos = { version = "0.4.0", features = ["esp32c6", "embassy", "defmt"] }
 embassy-executor = "0.10.0"
 embassy-time = "0.5.0"
 
+embassy-embedded-hal = { version = "0.6", optional = true }
+embassy-futures = { version = "0.1", optional = true }
+embassy-sync = { version = "0.8", optional = true }
+embedded-storage = { version = "0.3", optional = true }
 esp-alloc = { version = "0.11", features = ["esp32c6"], optional = true }
 esp-radio = { version = "=1.0.0-beta.1", features = ["esp32c6", "ble", "unstable", "defmt"], optional = true }
 esp-metadata-generated = { version = "0.5", features = ["esp32c6"], optional = true }
+esp-storage = { version = "0.10", features = ["esp32c6", "embedded-storage"], optional = true }
 portable-atomic = { version = "1", features = ["critical-section"], optional = true }
 rs-matter-embassy = { git = "https://github.com/sysgrok/rs-matter-embassy", rev = "2a806b0b1b521293b34a773618499e87402c843c", default-features = false, features = ["esp", "trouble", "openthread", "mbedtls", "openthread-heap-int-8192", "defmt"], optional = true }
 static_cell = { version = "2", optional = true }
