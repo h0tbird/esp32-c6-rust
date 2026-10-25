@@ -185,7 +185,8 @@ an ordinary single-color LED, and other boards may use a different pin or LED pr
 
 RMT channel 0 generates the LED signal using an 80 MHz peripheral clock. The firmware repeats
 red, green, cyan, blue, and magenta, with each color on for 500 milliseconds
-and the LED off for another 500 milliseconds. `LEVEL` sets the per-channel brightness to 10 out of 255.
+and the LED off for another 500 milliseconds. The shared `COLORS` table in `src/light.rs` sets
+the per-channel brightness to 10 out of 255.
 The 500 ms waits use Embassy async timers, letting other tasks run while the LED waits.
 The short RMT LED transmissions still use the blocking driver.
 
@@ -278,33 +279,57 @@ Hardware for this project:
 On the iPhone, check **Home > ... > Home Settings > Home Hubs & Bridges** and confirm the Apple TV
 is listed and available. Keep the phone and Apple TV on the same home network, not an isolated guest network.
 
-### Checkpoint 1: buildable networking baseline
+### Matter-controlled onboard LED
 
 There are now two firmware binaries. Only one runs on the board at a time:
 
 | Binary | Purpose |
 | --- | --- |
 | `esp32-c6-rust` (default) | The existing, hardware-tested five-color blinking firmware |
-| `matter-thread` | Experimental Matter On/Off Light endpoint, BLE commissioning, and Thread transport |
+| `matter-thread` | Matter-controlled onboard RGB blinking, BLE commissioning, Thread transport, and flash persistence |
 
 The second binary is in `src/bin/matter_thread.rs` and requires the opt-in `matter-thread` feature.
-Plain `cargo run --release` still selects the blinking firmware. Adding the networking code has
-not flashed or changed the firmware currently running on the board.
+Plain `cargo run --release` still selects the standalone blinking firmware, not the Apple Home accessory.
+Use the explicit `--features matter-thread --bin matter-thread` options below for Matter.
 
 The experimental binary allocates a 100 KiB heap for the radio/crypto dependencies, initializes
 hardware entropy for cryptography, and allocates the Matter stack statically rather than on
-the small execution stack. It uses the upstream example's development attestation credentials
-and volatile storage. These are for experiments, not a certified commercial accessory.
+the small execution stack. It uses the upstream example's public development attestation credentials
+and setup passcode. This is an experimental accessory, not a certified commercial product.
+Do not treat the example credentials as production secrets or publish your home network credentials.
 
-**Important limitations:**
+The Matter device type is "On/Off Light", but the hardware is only the board's RGB LED on GPIO8:
+no external light, relay, or wiring is needed.
 
-- This is a **build-verified baseline**, not a hardware-tested or successfully commissioned accessory.
-- The On/Off endpoint currently uses the upstream test device logic; it does **not** control GPIO8.
-- Pairing and Thread configuration are **not persisted**. A restart loses them; any test pairing
-  must be removed from Apple Home before recommissioning. The experimental Thread address and
-  commissioning discriminator are regenerated on startup.
-- No factory-reset mechanism or custom device identity has been implemented.
-- The default blinking binary still has no Thread or Matter support.
+- **On:** repeat red, green, cyan, blue, and magenta, with 500 ms on and 500 ms off.
+- **Off:** wake the LED task without waiting for the 500 ms timer and send black to the LED.
+- The first boot starts with the LED off. Later boots restore the saved On/Off state, unless the
+  Matter `StartUpOnOff` attribute requests Off, On, or Toggle instead.
+- Only changes to On/Off or startup settings are written to flash, not each blink or repeated
+  command with the same value.
+- `src/matter_light.rs` supplies the real device hooks. `src/light.rs` contains the testable sequence,
+  settings encoding, and stable identity derivation. The upstream test light logic is no longer used.
+- The standalone blinking binary still has no Thread or Matter support.
+
+### Pairing storage and device identity
+
+The integrated firmware reads the actual partition table and uses the existing **NVS partition**
+exclusively as a `SeqMapKvBlobStore`. On this board the reserved range is `0x9000..0xf000`
+(24 KiB), separate from the bootloader, partition table, PHY data, and application.
+No new partition layout or whole-chip erase is required. This is the sequential-storage format,
+not ESP-IDF's NVS format; do not share this partition with another firmware's NVS contents.
+
+The same store is supplied to Matter and the Thread transport so fabric credentials and network
+configuration can be loaded after a restart. The application's On/Off settings use a separate
+vendor key. Flash I/O errors and invalid settings are reported as failures rather than silently
+discarding pairing. Flash encryption is not configured by this project.
+
+The Thread EUI-64, commissioning discriminator, serial number, and Basic Information unique ID
+are derived from the chip's factory MAC address. They remain stable across reboots and reflashing.
+Radio cryptography still uses hardware entropy; the identity is not used as a cryptographic key.
+
+Normal flashing with the same partition layout leaves the NVS contents intact. Do not use an
+erase-all command or change the partition layout after pairing unless you intend to reset the accessory.
 
 ### Native build tools on macOS
 
@@ -374,8 +399,75 @@ Check both binaries with the networking feature enabled:
 cargo clippy --release --locked --features matter-thread --bins -- -D warnings
 ```
 
-The experimental release build, the default blink release build, and the combined Clippy check
-passed on 2026-10-25. No Matter firmware was flashed or paired as part of this checkpoint.
+The integrated release build and combined Clippy check passed on 2026-10-25.
+Build success alone does not establish successful commissioning or Apple Home control.
+
+The integrated firmware was also flashed to the board on 2026-10-25. Serial logs confirmed
+the reserved NVS range, a generated onboarding code, BLE host initialization, GATT advertising,
+and the initial LED-off command. After a reset, the identity and onboarding code stayed the same,
+and the firmware loaded LED settings and the events counter from flash. No unexpected panic
+or reboot was observed during these startup checks.
+
+Later on 2026-10-25, the user confirmed successful Apple Home commissioning and working On/Off
+control of the onboard LED. The first pairing attempt timed out; pairing succeeded after retrying
+near the Apple TV. This confirms operational Matter-over-Thread control, but does not establish
+distance as the cause of the earlier failure. Paired power-cycle recovery and the physical BOOT
+factory-reset procedure have not yet been confirmed.
+
+### Flash and add to Apple Home
+
+With the board connected by USB and the LLVM environment above selected, run:
+
+```sh
+cargo run --release --locked --features matter-thread --bin matter-thread
+```
+
+This replaces the currently running application with the integrated Matter firmware.
+The board may look idle because its LED starts off until you send On.
+Pressing Ctrl+C stops the serial monitor, not the firmware on the board.
+
+1. Keep your iPhone near the board with Bluetooth enabled. Your Apple TV must be available as
+   the home hub, as confirmed in **Home Settings > Home Hubs & Bridges**.
+2. Watch the serial output for the Matter onboarding QR payload / manual pairing code.
+   Use the code printed by this firmware, not the board's serial number or an unrelated example code.
+3. On the iPhone, open **Home > + > Add Accessory**. Scan the displayed onboarding QR code,
+   or use the manual code option. A development accessory may produce an uncertified-accessory warning.
+4. Name it something like **ESP32 Blink**. On should start the five-color loop; Off should stop it.
+5. Power-cycle the board and confirm the same accessory reconnects without being added again.
+   The log `Stored Matter fabric present: true` indicates fabric credentials were loaded.
+   A successful Thread attachment and working Home control are still needed to prove end-to-end recovery.
+
+The iPhone supplies the Thread network configuration during commissioning; there is no Wi-Fi
+SSID/password or Thread dataset to paste into this repository.
+
+### Deliberate factory reset
+
+To remove pairing from the board:
+
+1. While the integrated firmware is running, press and hold **BOOT (GPIO9)** for at least
+   five seconds. A shorter press cancels the operation.
+2. The firmware stops the network and LED tasks and erases **only the reserved NVS partition**,
+   including pairing, Thread configuration, and LED settings.
+3. Release BOOT when prompted. The firmware then restarts with the LED off and fresh commissioning.
+4. Remove any old accessory entry from Apple Home before pairing it again.
+
+Do not hold BOOT while pressing RESET or reconnecting power: GPIO9 is also the chip's boot-mode
+strap and can enter the serial download mode instead of running firmware.
+There is also an early-startup hold check before loading storage, but an ordinary reboot alone
+does not erase anything.
+
+### Local logic tests
+
+After a build has created `target`, run the hardware-independent tests on the Mac:
+
+```sh
+rustc --edition 2024 --test src/light.rs -o target/light-tests
+./target/light-tests
+```
+
+They cover all five colors and black intervals, Off at every sequence phase, restarting at red,
+the 500 ms interval constant, valid settings round-trips, rejection of malformed settings,
+and deterministic board-specific identity. They do not substitute for radio or Apple Home tests.
 
 ### Dependency compatibility
 
@@ -393,19 +485,13 @@ Git revisions avoid relying on moving upstream branches or replacing the existin
 experimental fork. `Cargo.lock` pins the remaining resolved dependencies. Logging consistently
 uses `defmt`; mixing the HAL's `log-04` and `defmt` features causes a build error.
 
-### Remaining checkpoints
+### Remaining verification
 
-1. Replace the test light logic with an interruptible LED task: **On** enables the blinking
-   sequence; **Off** cancels the wait and turns the LED off promptly.
-2. Add persistent storage for pairing credentials and Thread configuration, a stable device
-   identity, and a deliberate factory-reset mechanism. Do not erase flash casually after pairing.
-3. Flash the experimental firmware explicitly, inspect startup and BLE commissioning logs,
-   obtain its Matter setup code, and pair through **Home > + > Add Accessory**.
-   The board's serial number is not a Matter setup code.
-4. Verify Apple Home On/Off control and that pairing survives a power cycle.
-
-Do not treat this first checkpoint as the finished Apple Home accessory. The normal
-`cargo run --release` command intentionally continues to flash the known-working blink example.
+Apple Home commissioning and actual On/Off control have been confirmed by the user.
+Next, unplug the board, wait five seconds, reconnect it, and confirm the existing accessory
+responds to On/Off in Home without being added again. Allow time for it to rejoin Thread.
+This verifies paired power-cycle recovery; loading credentials from flash alone does not.
+The physical BOOT factory-reset procedure also remains to be verified.
 
 References:
 
