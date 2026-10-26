@@ -470,6 +470,14 @@ This is a host-side editor/build failure, not a panic in the running ESP32 firmw
 | Panic/backtrace or repeated startup | A firmware failure or reset to investigate |
 
 The `LED: off` frames between colors are blink intervals, not proof of an Off command.
+On this board, opening `espflash monitor --non-interactive --no-reset` reproduced
+CASE timeouts: reads failed both while that monitor was open and after it closed.
+A normal monitor startup/reset restored Thread attachment and successful reads,
+including after closing the monitor. Avoid `--no-reset` for this setup; it has not
+proved to be a non-disruptive way to observe the running device. The exact serial
+control-line/reset mechanism has not been established. This failure is distinct
+from a received Matter Busy response, and normal reset preserves stored fabrics.
+
 If Home's display disagrees with the board, compare iPhone and Mac, reopen Home, and
 capture one explicit On/Off attempt. Do not erase pairing as the first diagnostic step.
 
